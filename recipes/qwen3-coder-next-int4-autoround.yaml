@@ -22,7 +22,6 @@ mods:
 defaults:
   port: 8000
   host: 0.0.0.0
-  tensor_parallel: 2
   gpu_memory_utilization: 0.7
   max_model_len: 262144
 
@@ -40,7 +39,5 @@ command: |
     --port {port} \
     --load-format fastsafetensors \
     --enable-prefix-caching \
-    --max-model-len {max_model_len} \
-    -tp {tensor_parallel} \
-    --distributed-executor-backend ray
+    --max-model-len {max_model_len}
 
