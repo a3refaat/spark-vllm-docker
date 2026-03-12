@@ -101,19 +101,23 @@ export_persist GLOO_SOCKET_IFNAME "$ETH_IF_NAME"
 export_persist TP_SOCKET_IFNAME "$ETH_IF_NAME"
 export_persist RAY_memory_monitor_refresh_ms "0"
 
+# UMA Memory Optimization (DGX Spark 128GB shared CPU/GPU memory)
+# Disable pre-started idle workers (saves ~8 GiB on head node)
+export_persist RAY_num_prestart_python_workers "0"
+# Limit object store to 1 GiB (default 30% of RAM = 33 GiB, wastes UMA)
+export_persist RAY_object_store_memory "1073741824"
+
 # --- Execution ---
 
 if [ "${NODE_TYPE}" == "head" ]; then
     echo "Starting Ray HEAD node..."
-    exec ray start --block --head --port 6379 \
+    exec ray start --block --head --port 6379 --object-store-memory 1073741824 --num-cpus 2 \
         --node-ip-address "$VLLM_HOST_IP" \
-	--include-dashboard=True \
-        --dashboard-host "0.0.0.0" \
-        --dashboard-port 8265 \
+	--include-dashboard=false \
         --disable-usage-stats
 else
     echo "Starting Ray WORKER node connecting to $HEAD_IP..."
-    exec ray start --block \
+    exec ray start --block --object-store-memory 1073741824 --num-cpus 2 --disable-usage-stats \
         --address="$HEAD_IP:6379" \
         --node-ip-address "$VLLM_HOST_IP"
 fi
