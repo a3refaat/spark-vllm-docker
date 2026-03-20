@@ -110,7 +110,7 @@ if [ -z "${MODEL_NAME:-}" ]; then
 fi
 
 # Check if uvx is installed
-if ! command -v uvx &> /dev/null; then
+if ! command -v uv &> /dev/null; then
     echo "Error: 'uvx' command not found."
     echo ""
     echo "Please install uvx first by running:"
