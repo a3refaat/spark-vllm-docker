@@ -47,7 +47,7 @@ RUN apt update && \
 
 # Additional deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-     uv pip install torch torchvision torchaudio triton --index-url https://download.pytorch.org/whl/nightly/cu130 && \
+     uv pip install torch==2.12.0.dev20260408+cu130 torchvision==0.27.0.dev20260408+cu130 torchaudio==2.11.0.dev20260408+cu130 triton --index-url https://download.pytorch.org/whl/nightly/cu130 && \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2" filelock pynvml requests tqdm
 
 # Configure Ccache for CUDA/C++
@@ -120,6 +120,32 @@ RUN if [ -n "$FLASHINFER_PRS" ]; then \
             echo "Fetching and applying PR #$pr..."; \
             curl -fL "https://github.com/flashinfer-ai/flashinfer/pull/${pr}.diff" | git apply -v; \
         done; \
+    fi
+
+# Remove K=128 large tiles that don't fit SM121's 101KB SMEM (Stages=1 → static_assert fail).
+# Keep only K=64 tiles + 128x128x128 (the only K=128 tile that fits with 2 stages).
+RUN sed -i 's/\[128, 128, 256\],/# REMOVED for SM121: [128, 128, 256],/' flashinfer/jit/gemm/cutlass/generate_kernels.py && \
+    sed -i 's/\[128, 256, 128\],/# REMOVED for SM121: [128, 256, 128],/' flashinfer/jit/gemm/cutlass/generate_kernels.py && \
+    sed -i 's/\[256, 128, 128\],/# REMOVED for SM121: [256, 128, 128],/' flashinfer/jit/gemm/cutlass/generate_kernels.py && \
+    echo "[OK] Removed large K=128 tiles from generate_kernels.py" && \
+    sed -i '/TileM == 128 && TileN == 128 && TileK == 256/d' \
+        csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch_tma_ws.h && \
+    sed -i '/TileM == 128 && TileN == 256 && TileK == 128/d' \
+        csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch_tma_ws.h && \
+    sed -i '/TileM == 256 && TileN == 128 && TileK == 128/d' \
+        csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch_tma_ws.h && \
+    echo "[OK] Removed large K=128 tiles from dispatch header"
+# Apply E2M1 SM121 fix: remove SM121 from CUDA_PTX_FP4FP6_CVT_ENABLED
+# SM121 (GB10) lacks cvt.rn.satfinite.e2m1x2.f32 PTX instruction
+# Reference: https://github.com/Avarok-Cybersecurity/dgx-vllm
+COPY patches/build/flashinfer_e2m1_sm121.patch .
+RUN if [ -f flashinfer_e2m1_sm121.patch ]; then \
+        if patch -p1 --dry-run --reverse < flashinfer_e2m1_sm121.patch &>/dev/null; then \
+            echo "E2M1 SM121 CUTLASS patch already applied"; \
+        else \
+            echo "Applying E2M1 SM121 CUTLASS patch..." && \
+            patch -p1 < flashinfer_e2m1_sm121.patch; \
+        fi; \
     fi
 
 # TEMPORARY patch for flashinfer autotune and other improvements (PR 2927) - MERGED 4/3
@@ -204,25 +230,7 @@ RUN if [ -n "$VLLM_PRS" ]; then \
         done; \
     fi
 
-# TEMPORARY PATCH for broken FP8 kernels - https://github.com/vllm-project/vllm/pull/35568
-RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/35568.diff -o pr35568.diff \
-    && if git apply --reverse --check pr35568.diff 2>/dev/null; then \
-         echo "PR 35568 already applied, skipping."; \
-       else \
-         echo "Applying PR 35568..."; \
-         git apply -v pr35568.diff; \
-       fi \
-    && rm pr35568.diff
 
-# TEMPORARY PATCH for broken compilation - https://github.com/vllm-project/vllm/pull/38919
-RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/38919.diff -o pr38919.diff \
-    && if git apply --reverse --check pr38919.diff 2>/dev/null; then \
-         echo "PR 38919 already applied, skipping."; \
-       else \
-         echo "Applying PR 38919..."; \
-         git apply -v pr38919.diff; \
-       fi \
-    && rm pr38919.diff
 
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
@@ -308,7 +316,7 @@ ARG PRE_TRANSFORMERS=0
 
 # Install deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-     uv pip install torch torchvision torchaudio triton --index-url https://download.pytorch.org/whl/nightly/cu130 && \
+     uv pip install torch==2.12.0.dev20260408+cu130 torchvision==0.27.0.dev20260408+cu130 torchaudio==2.11.0.dev20260408+cu130 triton --index-url https://download.pytorch.org/whl/nightly/cu130 && \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2"
 
 # Install wheels from host ./wheels/ (bind-mounted from build context — no layer bloat)
