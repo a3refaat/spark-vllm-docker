@@ -1,0 +1,101 @@
+# Recipe: MiMo-V2.5-NVFP4 on 2x DGX Spark / GB10
+#
+# Target model: https://huggingface.co/lukealonso/MiMo-V2.5-NVFP4
+# This is the NVFP4 expert-quantized export, not the Xiaomi FP8 checkpoint.
+#
+# Applied from CyberTen's NVIDIA forum notes for MiMo V2.5 on GB10:
+#   - Ray V2 executor for cross-node stability.
+#   - MiMo parsers; never use qwen3 parser for MiMo reasoning/tool calls.
+#   - PR #41797 / TRITON_ATTN_DIFFKV fallback for MiMoV2 DiffKV attention on
+#     sm_121a where FA3/FA4 is unavailable.
+#   - MTP-2 is enabled for speculative decoding; the runtime mod patches the
+#     MiMo-V2 MTP qkv loader for this NVFP4 checkpoint's deinterleaved layout
+#     and mirrors Omni-mapped MTP quant metadata back to draft model.mtp.* keys.
+#   - VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 for GB10 cudagraph estimator
+#     overestimation.
+#   - soundfile + librosa are installed for vLLM audio input support.
+#   - Omni architecture is enabled with text/image/video/audio inputs.
+#
+# Current validated serving shape:
+#   - fp8_e4m3 KV cache is enabled; current metrics report
+#     calculate_kv_scales=False, so revisit KV scale calculation for stricter
+#     long-context quality studies.
+#   - Prefix caching and chunked prefill are enabled.
+#   - 131072 context has been brought up on 2x Spark; peak-context throughput
+#     benchmarking is still workload-sensitive, especially at concurrency > 1.
+
+recipe_version: "1"
+name: MiMo-V2.5-NVFP4-TP2-DGX-Spark
+description: >
+  vLLM serving lukealonso/MiMo-V2.5-NVFP4 (310B MoE, NVFP4 expert quant)
+  on a 2x DGX Spark / GB10 cluster with TP=2 via Ray.
+
+model: lukealonso/MiMo-V2.5-NVFP4
+container: vllm-node-mimo-v25-nvfp4
+cluster_only: true
+solo_only: false
+
+# Build a dedicated image so the MiMo DiffKV backend is present even when a
+# stock vllm-node image already exists locally.
+build_args:
+  - --apply-vllm-pr
+  - "41797"
+
+mods:
+  - mods/drop-caches
+  - mods/fix-mimo-v2-vllm
+  - mods/fix-modelopt-mixed-mxfp8
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: MiMo-V2.5-NVFP4
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  gpu_memory_utilization: 0.86
+  max_model_len: 131072
+  max_num_batched_tokens: 16384
+
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  TORCH_CUDA_ARCH_LIST: "12.1a"
+  VLLM_USE_RAY_V2_EXECUTOR_BACKEND: "1"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "1"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_NVLS_ENABLE: "0"
+  # NVFP4 / ModelOpt path. Keep the conservative FlashInfer-CUTLASS path by
+  # default. The experimental flashinfer-b12x MoE/GEMM path crashed the Spark
+  # cluster during bring-up and should only be retried in a small isolated test.
+  VLLM_NVFP4_GEMM_BACKEND: flashinfer-cutlass
+  VLLM_USE_FLASHINFER_MOE_FP4: "1"
+  VLLM_FLASHINFER_MOE_BACKEND: throughput
+
+command: |
+  vllm serve lukealonso/MiMo-V2.5-NVFP4 \
+      --served-model-name {served_model_name} \
+      --trust-remote-code \
+      --dtype auto \
+      --kv-cache-dtype fp8_e4m3 \
+      --block-size 64 \
+      --attention-backend triton_attn_diffkv \
+      --hf-overrides '{{"architectures":["MiMoV2OmniForCausalLM"]}}' \
+      --limit-mm-per-prompt '{{"image":4,"video":1,"audio":1}}' \
+      --host {host} \
+      --port {port} \
+      --tensor-parallel-size {tensor_parallel} \
+      --pipeline-parallel-size {pipeline_parallel} \
+      --distributed-executor-backend ray \
+      --speculative-config '{{"method":"mtp","num_speculative_tokens":2}}' \
+      --no-async-scheduling \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --enable-prefix-caching \
+      --enable-chunked-prefill \
+      --load-format instanttensor \
+      --enable-auto-tool-choice \
+      --tool-call-parser mimo \
+      --reasoning-parser mimo
