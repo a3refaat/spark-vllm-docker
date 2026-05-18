@@ -15,6 +15,36 @@ import soundfile  # noqa: F401
 import librosa  # noqa: F401
 PY
 
+# PR #42969: the "mimo" tool parser is an alias for Qwen3XMLToolParser.  When
+# the streaming XML parser closes a <function> element it already marks the
+# function closed, but older vLLM builds leave current_function_name populated.
+# Fallback recovery can then treat the function as still active and emit an
+# extra closing brace in streamed tool-call deltas.
+python3 - <<'PY'
+from pathlib import Path
+path = Path('/usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/qwen3xml_tool_parser.py')
+if not path.exists():
+    print('[fix-mimo-v2-vllm] qwen3xml tool parser not present; skipping PR #42969')
+    raise SystemExit
+text = path.read_text()
+old = '''            self.current_function_open = False
+
+        elif name == "tool_call":
+'''
+new = '''            self.current_function_open = False
+            self.current_function_name = None
+
+        elif name == "tool_call":
+'''
+if new in text:
+    print('[fix-mimo-v2-vllm] Qwen3XML/MiMo tool parser PR #42969 already patched')
+elif old in text:
+    path.write_text(text.replace(old, new, 1))
+    print('[fix-mimo-v2-vllm] patched Qwen3XML/MiMo streaming tool parser (#42969)')
+else:
+    raise SystemExit('[fix-mimo-v2-vllm] ERROR: Qwen3XML tool parser pattern not found for PR #42969')
+PY
+
 # Some current vLLM builds have the MiMo V2 model class but not a HF config
 # registry entry for model_type=mimo_v2. Transformers then tries to fetch a
 # nonexistent remote configuration_mimo_v2.py from the NVFP4 repo and aborts

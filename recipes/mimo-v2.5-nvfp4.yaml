@@ -6,6 +6,7 @@
 # Applied from CyberTen's NVIDIA forum notes for MiMo V2.5 on GB10:
 #   - Ray V2 executor for cross-node stability.
 #   - MiMo parsers; never use qwen3 parser for MiMo reasoning/tool calls.
+#   - PR #42969 parser cleanup for streamed MiMo/Qwen3XML tool-call deltas.
 #   - PR #41797 / TRITON_ATTN_DIFFKV fallback for MiMoV2 DiffKV attention on
 #     sm_121a where FA3/FA4 is unavailable.
 #   - MTP-2 is enabled for speculative decoding; the runtime mod patches the

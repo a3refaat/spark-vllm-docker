@@ -57,7 +57,10 @@ Applies MiMo-specific runtime fixes:
 - applies the same QKV-aware loading to MTP layers;
 - adds Omni `packed_modules_mapping` so fused modules resolve quant metadata;
 - mirrors Omni-remapped MTP quant metadata back to draft `model.mtp.*` prefixes;
-- selects `MiMoV2OmniMTPModel` when a raw MiMo config advertises `vision_config`.
+- selects `MiMoV2OmniMTPModel` when a raw MiMo config advertises `vision_config`;
+- applies vLLM PR #42969 for the Qwen3XML/MiMo streaming tool parser so a
+  closed `<function>` clears `current_function_name` and does not emit duplicate
+  recovery braces.
 
 The QKV loader change is critical: the NVFP4 checkpoint stores fused QKV as canonical `[Q_all][K_all][V_all]`, not TP-prepacked `[Q0 K0 V0][Q1 K1 V1]`. Blind `chunk(tp_size, dim=0)` is shape-correct but corrupts K/V rows.
 
