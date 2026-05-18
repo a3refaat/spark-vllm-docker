@@ -56,6 +56,10 @@ defaults:
   gpu_memory_utilization: 0.86
   max_model_len: 131072
   max_num_batched_tokens: 16384
+  # Default/server-wide generation cap. vLLM expects max_new_tokens here and
+  # converts it to SamplingParams.max_tokens. Keep this comfortably below the
+  # context window so long prompts still have room for output.
+  max_new_tokens: 8192
 
 
 env:
@@ -83,6 +87,8 @@ command: |
       --block-size 64 \
       --attention-backend triton_attn_diffkv \
       --hf-overrides '{{"architectures":["MiMoV2OmniForCausalLM"]}}' \
+      --generation-config vllm \
+      --override-generation-config '{{"temperature":1.0,"top_p":0.95,"max_new_tokens":{max_new_tokens}}}' \
       --limit-mm-per-prompt '{{"image":4,"video":1,"audio":1}}' \
       --host {host} \
       --port {port} \

@@ -18,6 +18,7 @@ The recipe targets [`lukealonso/MiMo-V2.5-NVFP4`](https://huggingface.co/lukealo
 - FP8 E4M3 KV cache
 - prefix caching and chunked prefill
 - 131072 max model length
+- explicit generation defaults: `temperature=1.0`, `top_p=0.95`, `max_new_tokens=8192`
 
 Expected startup markers:
 
