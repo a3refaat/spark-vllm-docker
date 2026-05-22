@@ -1,0 +1,33 @@
+model: nvidia/MiniMax-M2.7-NVFP4
+name: MiniMax-M2.7-NVFP4
+recipe_version: 1
+container: vllm-node
+mods:
+  - mods/anneal-hot-reload
+defaults:
+
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.85
+  max_model_len: 196608
+  tool_call_parser: minimax_m2
+
+command: |-
+  vllm serve nvidia/MiniMax-M2.7-NVFP4 \
+    --trust-remote-code \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    -tp {tensor_parallel} \
+    --distributed-executor-backend ray \
+    --moe-backend flashinfer_cutlass \
+    --attention-backend flashinfer \
+    --kv-cache-dtype fp8_e4m3 \
+    --linear-backend auto \
+    --max-model-len {max_model_len} \
+    --load-format instanttensor \
+    --enable-auto-tool-choice \
+    --tool-call-parser {tool_call_parser} \
+    --reasoning-parser minimax_m2_append_think \
+    --host {host} \
+    --port {port}
+
