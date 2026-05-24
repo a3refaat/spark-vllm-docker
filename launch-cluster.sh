@@ -820,6 +820,7 @@ get_env_flags() {
 prearm_nsys_session_local() {
     local container="$1"; local session="$2"
     local stem="/tmp/anneal_nsys/prearmed/$session"
+    local budget="${ANNEAL_NSYS_CAPTURE_COUNT:-1}"
     if [[ "${ANNEAL_NSYS_PREARM:-1}" == "0" ]]; then
         return 0
     fi
@@ -827,11 +828,16 @@ prearm_nsys_session_local() {
     docker exec "$container" bash -lc "
         set -e
         mkdir -p /tmp/anneal_nsys/prearmed
-        rm -f '$stem.nsys-rep' '$stem.sqlite' '$stem.armed'
+        rm -f '$stem.nsys-rep' '$stem'.*.nsys-rep '$stem.sqlite' '$stem'.*.sqlite '$stem.armed' '$stem.budget'
         for i in \$(seq 1 60); do
             if nsys sessions list 2>/dev/null | grep -Fq '$session'; then
-                nsys start --session '$session' --capture-range=cudaProfilerApi --capture-range-end=stop \
+                capture_end=stop
+                if [ '$budget' != '1' ]; then
+                    capture_end='repeat:$budget'
+                fi
+                nsys start --session '$session' --capture-range=cudaProfilerApi --capture-range-end=\$capture_end \
                     --sample=none --cpuctxsw=none --force-overwrite=true -o '$stem'
+                printf '%s\n' '$budget' > '$stem.budget'
                 touch '$stem.armed'
                 exit 0
             fi
@@ -845,6 +851,7 @@ prearm_nsys_session_local() {
 prearm_nsys_session_remote() {
     local worker_ip="$1"; local container="$2"; local session="$3"
     local stem="/tmp/anneal_nsys/prearmed/$session"
+    local budget="${ANNEAL_NSYS_CAPTURE_COUNT:-1}"
     if [[ "${ANNEAL_NSYS_PREARM:-1}" == "0" ]]; then
         return 0
     fi
@@ -853,11 +860,16 @@ prearm_nsys_session_remote() {
         "docker exec $container bash -lc \"
             set -e
             mkdir -p /tmp/anneal_nsys/prearmed
-            rm -f '$stem.nsys-rep' '$stem.sqlite' '$stem.armed'
+            rm -f '$stem.nsys-rep' '$stem'.*.nsys-rep '$stem.sqlite' '$stem'.*.sqlite '$stem.armed' '$stem.budget'
             for i in \\\$(seq 1 60); do
                 if nsys sessions list 2>/dev/null | grep -Fq '$session'; then
-                    nsys start --session '$session' --capture-range=cudaProfilerApi --capture-range-end=stop \\
+                    capture_end=stop
+                    if [ '$budget' != '1' ]; then
+                        capture_end='repeat:$budget'
+                    fi
+                    nsys start --session '$session' --capture-range=cudaProfilerApi --capture-range-end=\\$capture_end \\
                         --sample=none --cpuctxsw=none --force-overwrite=true -o '$stem'
+                    printf '%s\n' '$budget' > '$stem.budget'
                     touch '$stem.armed'
                     exit 0
                 fi
