@@ -817,6 +817,57 @@ get_env_flags() {
         "RAY_object_store_memory=1073741824"
 }
 
+prearm_nsys_session_local() {
+    local container="$1"; local session="$2"
+    local stem="/tmp/anneal_nsys/prearmed/$session"
+    if [[ "${ANNEAL_NSYS_PREARM:-1}" == "0" ]]; then
+        return 0
+    fi
+    echo "Pre-arming Nsight CUDA capture for session $session..."
+    docker exec "$container" bash -lc "
+        set -e
+        mkdir -p /tmp/anneal_nsys/prearmed
+        rm -f '$stem.nsys-rep' '$stem.sqlite' '$stem.armed'
+        for i in \$(seq 1 60); do
+            if nsys sessions list 2>/dev/null | grep -Fq '$session'; then
+                nsys start --session '$session' --capture-range=cudaProfilerApi --capture-range-end=stop \
+                    --sample=none --cpuctxsw=none --force-overwrite=true -o '$stem'
+                touch '$stem.armed'
+                exit 0
+            fi
+            sleep 1
+        done
+        echo 'Timed out waiting for Nsight session $session' >&2
+        exit 1
+    "
+}
+
+prearm_nsys_session_remote() {
+    local worker_ip="$1"; local container="$2"; local session="$3"
+    local stem="/tmp/anneal_nsys/prearmed/$session"
+    if [[ "${ANNEAL_NSYS_PREARM:-1}" == "0" ]]; then
+        return 0
+    fi
+    echo "Pre-arming Nsight CUDA capture for session $session on $worker_ip..."
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
+        "docker exec $container bash -lc \"
+            set -e
+            mkdir -p /tmp/anneal_nsys/prearmed
+            rm -f '$stem.nsys-rep' '$stem.sqlite' '$stem.armed'
+            for i in \\\$(seq 1 60); do
+                if nsys sessions list 2>/dev/null | grep -Fq '$session'; then
+                    nsys start --session '$session' --capture-range=cudaProfilerApi --capture-range-end=stop \\
+                        --sample=none --cpuctxsw=none --force-overwrite=true -o '$stem'
+                    touch '$stem.armed'
+                    exit 0
+                fi
+                sleep 1
+            done
+            echo 'Timed out waiting for Nsight session $session' >&2
+            exit 1
+        \""
+}
+
 # Start Ray head node inside the container
 start_ray_head() {
     local container="$1"
@@ -828,6 +879,9 @@ start_ray_head() {
     fi
     docker exec -d "$container" bash -c \
         "$ray_cmd >> /proc/1/fd/1 2>&1"
+    if [[ "${ANNEAL_NSYS_RAY:-0}" == "1" ]]; then
+        prearm_nsys_session_local "$container" "anneal_ray_head"
+    fi
 }
 
 # Start Ray worker node inside the container on a remote host
@@ -843,6 +897,9 @@ start_ray_worker() {
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
         "docker exec -d $container bash -c \
          '$ray_cmd >> /proc/1/fd/1 2>&1'"
+    if [[ "${ANNEAL_NSYS_RAY:-0}" == "1" ]]; then
+        prearm_nsys_session_remote "$worker_ip" "$container" "anneal_ray_worker_${safe_worker_ip}"
+    fi
 }
 
 # Start Cluster Function
