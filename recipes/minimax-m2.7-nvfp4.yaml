@@ -3,6 +3,7 @@ name: MiniMax-M2.7-NVFP4
 recipe_version: 1
 container: vllm-node
 mods:
+  - mods/nsight-systems
   - mods/anneal-hot-reload
 defaults:
 

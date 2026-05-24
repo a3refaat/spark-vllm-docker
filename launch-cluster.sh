@@ -821,20 +821,28 @@ get_env_flags() {
 start_ray_head() {
     local container="$1"
     echo "Starting Ray HEAD node on $HEAD_IP..."
+    local ray_cmd="ray start --block --head --port $MASTER_PORT --object-store-memory 1073741824 --num-cpus 2 \
+         --node-ip-address $HEAD_IP --include-dashboard=false --disable-usage-stats"
+    if [[ "${ANNEAL_NSYS_RAY:-0}" == "1" ]]; then
+        ray_cmd="nsys launch --session-new=anneal_ray_head --trace=cuda,nvtx,osrt --cuda-graph-trace=node --wait=all $ray_cmd"
+    fi
     docker exec -d "$container" bash -c \
-        "ray start --block --head --port $MASTER_PORT --object-store-memory 1073741824 --num-cpus 2 \
-         --node-ip-address $HEAD_IP --include-dashboard=false --disable-usage-stats \
-         >> /proc/1/fd/1 2>&1"
+        "$ray_cmd >> /proc/1/fd/1 2>&1"
 }
 
 # Start Ray worker node inside the container on a remote host
 start_ray_worker() {
     local worker_ip="$1"; local container="$2"
     echo "Starting Ray WORKER node on $worker_ip..."
+    local safe_worker_ip="${worker_ip//[^a-zA-Z0-9]/_}"
+    local ray_cmd="ray start --block --object-store-memory 1073741824 --num-cpus 2 --disable-usage-stats \
+          --address=$HEAD_IP:$MASTER_PORT --node-ip-address $worker_ip"
+    if [[ "${ANNEAL_NSYS_RAY:-0}" == "1" ]]; then
+        ray_cmd="nsys launch --session-new=anneal_ray_worker_${safe_worker_ip} --trace=cuda,nvtx,osrt --cuda-graph-trace=node --wait=all $ray_cmd"
+    fi
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
         "docker exec -d $container bash -c \
-         'ray start --block --object-store-memory 1073741824 --num-cpus 2 --disable-usage-stats \
-          --address=$HEAD_IP:$MASTER_PORT --node-ip-address $worker_ip >> /proc/1/fd/1 2>&1'"
+         '$ray_cmd >> /proc/1/fd/1 2>&1'"
 }
 
 # Start Cluster Function

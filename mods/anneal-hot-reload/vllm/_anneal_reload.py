@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -327,6 +328,107 @@ def _profiler_stop_distributed() -> Dict[str, Any]:
     result = _profiler_stop()
     result["distributed"] = False
     return result
+
+
+# ── Nsight Systems support ───────────────────────────────────────────────
+
+
+def _cuda_profiler_api(action: str) -> Dict[str, Any]:
+    """Call cudaProfilerStart/Stop in the current worker process."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        cudart = torch.cuda.cudart()
+        fn = cudart.cudaProfilerStart if action == "start" else cudart.cudaProfilerStop
+        rc = fn()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return {"success": int(rc) == 0, "return_code": int(rc), "pid": os.getpid(), "action": action}
+    except Exception as e:
+        return {"success": False, "error": f"cudaProfiler{action.title()} failed: {e}\n{traceback.format_exc()}", "pid": os.getpid()}
+
+
+def _worker_cuda_profiler(worker: Any, action: str) -> Dict[str, Any]:
+    result = _cuda_profiler_api(action)
+    try:
+        result["worker_class"] = worker.__class__.__name__
+        runner = getattr(worker, "model_runner", None)
+        result["runner_class"] = runner.__class__.__name__ if runner else ""
+        import torch
+        result["device"] = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
+    except Exception:
+        pass
+    return result
+
+
+def _cuda_profiler_distributed(action: str) -> Dict[str, Any]:
+    if _is_ray_worker_process():
+        result = _cuda_profiler_api(action)
+        result["distributed"] = False
+        result["ray_worker_local"] = True
+        return result
+    targets = _get_collective_rpc_targets()
+    if targets:
+        try:
+            worker_results = targets[0].collective_rpc(_worker_cuda_profiler, timeout=120, args=(action,))
+            success = all(r.get("success", False) for r in worker_results)
+            return {"success": success, "distributed": True, "worker_results": worker_results,
+                    "error": "; ".join(r.get("error", "") for r in worker_results if not r.get("success", False))}
+        except Exception as e:
+            logger.warning("Distributed cuda profiler %s failed: %s", action, e)
+    result = _cuda_profiler_api(action)
+    result["distributed"] = False
+    return result
+
+
+def _worker_runtime_info(worker: Any) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "success": True,
+        "pid": os.getpid(),
+        "hostname": socket.gethostname(),
+        "worker_class": worker.__class__.__name__,
+    }
+    try:
+        import torch
+        info["device"] = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
+        props = torch.cuda.get_device_properties(torch.cuda.current_device()) if torch.cuda.is_available() else None
+        if props is not None:
+            info["device_name"] = props.name
+            info["device_uuid"] = str(getattr(props, "uuid", ""))
+    except Exception as e:
+        info["device_error"] = str(e)
+    try:
+        rank = getattr(worker, "rank", None)
+        local_rank = getattr(worker, "local_rank", None)
+        if rank is not None:
+            info["rank"] = int(rank)
+        if local_rank is not None:
+            info["local_rank"] = int(local_rank)
+        runner = getattr(worker, "model_runner", None)
+        info["runner_class"] = runner.__class__.__name__ if runner else ""
+    except Exception:
+        pass
+    return info
+
+
+def _runtime_workers_distributed() -> Dict[str, Any]:
+    if _is_ray_worker_process():
+        return {"success": True, "distributed": False, "workers": [_worker_runtime_info(None)], "ray_worker_local": True}
+    targets = _get_collective_rpc_targets()
+    if targets:
+        try:
+            worker_results = targets[0].collective_rpc(_worker_runtime_info, timeout=120)
+            workers = []
+            for i, r in enumerate(worker_results):
+                r = dict(r)
+                r.setdefault("rank", i)
+                workers.append(r)
+            return {"success": True, "distributed": True, "worker_count": len(workers), "workers": workers}
+        except Exception as e:
+            logger.warning("Distributed runtime worker discovery failed: %s", e)
+            return {"success": False, "distributed": True, "error": str(e)}
+    return {"success": True, "distributed": False, "workers": [{"success": True, "pid": os.getpid(), "hostname": socket.gethostname()}]}
 
 
 # ── Live vLLM resolver + CUDA graph refresh ──────────────────────────────
@@ -871,6 +973,18 @@ class _AnnealHandler(BaseHTTPRequestHandler):
         elif self.path == "/cudagraph/refresh":
             with _reload_lock:
                 result = _refresh_cuda_graphs_distributed()
+            self._send_json(result, 200 if result.get("success") else 500)
+
+        elif self.path == "/runtime/workers":
+            result = _runtime_workers_distributed()
+            self._send_json(result, 200 if result.get("success") else 500)
+
+        elif self.path == "/cuda_profiler/start":
+            result = _cuda_profiler_distributed("start")
+            self._send_json(result, 200 if result.get("success") else 500)
+
+        elif self.path == "/cuda_profiler/stop":
+            result = _cuda_profiler_distributed("stop")
             self._send_json(result, 200 if result.get("success") else 500)
 
         elif self.path == "/profiler/start":
