@@ -12,6 +12,7 @@ anneal package at runtime.
 from __future__ import annotations
 
 import errno
+import functools
 import gc
 import hashlib
 import importlib
@@ -27,6 +28,7 @@ import tempfile
 import threading
 import time
 import traceback
+import types
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -328,6 +330,355 @@ def _profiler_stop_distributed() -> Dict[str, Any]:
     result = _profiler_stop()
     result["distributed"] = False
     return result
+
+
+# ── NVTX attribution markers ─────────────────────────────────────────────
+
+_ATTRIBUTION_LEVELS = {"off": 0, "none": 0, "phase": 1, "op": 2, "layer": 3}
+_nvtx_level = os.environ.get("ANNEAL_NVTX_LEVEL", "off").lower()
+_marker_patch_thread_started = False
+_marker_patch_lock = threading.Lock()
+_patched_marker_classes: set[str] = set()
+_patched_layer_models: set[int] = set()
+
+
+def _normalise_attribution_level(level: str) -> str:
+    level = (level or "off").lower()
+    return level if level in _ATTRIBUTION_LEVELS else "off"
+
+
+def _attribution_enabled(required: str = "phase") -> bool:
+    return _ATTRIBUTION_LEVELS.get(_normalise_attribution_level(_nvtx_level), 0) >= _ATTRIBUTION_LEVELS[required]
+
+
+def _nvtx_push(name: str) -> bool:
+    try:
+        import torch
+        torch.cuda.nvtx.range_push(str(name)[:4096])
+        return True
+    except Exception:
+        return False
+
+
+def _nvtx_pop(active: bool) -> None:
+    if not active:
+        return
+    try:
+        import torch
+        torch.cuda.nvtx.range_pop()
+    except Exception:
+        pass
+
+
+def _len_maybe(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        return len(value)
+    except Exception:
+        pass
+    for attr in ("req_ids", "request_ids", "requests", "cached_reqs"):
+        try:
+            inner = getattr(value, attr, None)
+            if inner is not None:
+                return len(inner)
+        except Exception:
+            pass
+    return 0
+
+
+def _scheduler_counts(scheduler_output: Any) -> List[int]:
+    value = getattr(scheduler_output, "num_scheduled_tokens", None)
+    if isinstance(value, dict):
+        raw = list(value.values())
+    elif value is None:
+        raw = []
+    else:
+        try:
+            raw = list(value)
+        except Exception:
+            raw = []
+    counts: List[int] = []
+    for item in raw:
+        try:
+            counts.append(int(item))
+        except Exception:
+            pass
+    return counts
+
+
+def _infer_scheduler_phase(scheduler_output: Any, dummy_run: bool = False) -> str:
+    if dummy_run:
+        return "dummy"
+    if scheduler_output is None:
+        return "unknown"
+    try:
+        total = int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0)
+    except Exception:
+        total = 0
+    if total <= 0:
+        return "idle"
+    counts = _scheduler_counts(scheduler_output)
+    new_reqs = _len_maybe(getattr(scheduler_output, "scheduled_new_reqs", None))
+    prefill_like = new_reqs > 0 or any(c > 1 for c in counts)
+    decode_like = any(c == 1 for c in counts)
+    if prefill_like and decode_like:
+        return "mixed"
+    if prefill_like:
+        return "prefill"
+    if decode_like:
+        return "decode"
+    return "unknown"
+
+
+def _scheduler_summary(scheduler_output: Any) -> str:
+    if scheduler_output is None:
+        return "tokens=0 reqs=0 new=0"
+    counts = _scheduler_counts(scheduler_output)
+    try:
+        total = int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or sum(counts))
+    except Exception:
+        total = sum(counts)
+    new_reqs = _len_maybe(getattr(scheduler_output, "scheduled_new_reqs", None))
+    cached_reqs = _len_maybe(getattr(scheduler_output, "scheduled_cached_reqs", None))
+    reqs = max(len(counts), new_reqs + cached_reqs, cached_reqs)
+    return f"tokens={total} reqs={reqs} new={new_reqs} cached={cached_reqs}"
+
+
+def _runner_graph_hint(runner: Any) -> str:
+    try:
+        mgr = getattr(runner, "cudagraph_manager", None)
+        if mgr is not None:
+            return f" cg={mgr.__class__.__name__}"
+    except Exception:
+        pass
+    try:
+        cc = getattr(runner, "compilation_config", None)
+        if cc is not None:
+            return f" cg_mode={getattr(cc, 'cudagraph_mode', '')}"
+    except Exception:
+        pass
+    return ""
+
+
+def _layer_op_name(module_name: str, cls_name: str) -> Optional[str]:
+    lower_name = module_name.lower()
+    lower_cls = cls_name.lower()
+    if "embed" in lower_name or "lm_head" in lower_name:
+        return None
+    if "self_attn" in lower_name or "attention" in lower_cls or lower_name.endswith("attn"):
+        return "attention"
+    if "mlp" in lower_name or "moe" in lower_name or "expert" in lower_name or "mlp" in lower_cls or "moe" in lower_cls:
+        return "mlp"
+    if "norm" in lower_name or "norm" in lower_cls:
+        return "norm"
+    if re.search(r"(^|\.)layers?\.\d+$", module_name) or "decoderlayer" in lower_cls:
+        return "layer"
+    return None
+
+
+def _wrap_model_layers_for_nvtx(model: Any) -> None:
+    if not _attribution_enabled("layer") or model is None:
+        return
+    model_id = id(model)
+    if model_id in _patched_layer_models:
+        return
+    _patched_layer_models.add(model_id)
+    try:
+        named_modules = list(model.named_modules())
+    except Exception:
+        return
+    wrapped = 0
+    for name, module in named_modules:
+        if not name or wrapped >= int(os.environ.get("ANNEAL_NVTX_MAX_LAYER_MARKERS", "512")):
+            continue
+        cls_name = module.__class__.__name__
+        op = _layer_op_name(name, cls_name)
+        if op is None or getattr(module, "__anneal_nvtx_wrapped__", False):
+            continue
+        original = getattr(module, "forward", None)
+        if not callable(original):
+            continue
+
+        @functools.wraps(original)
+        def wrapped_forward(*args: Any, __orig=original, __name=name, __cls=cls_name, __op=op, **kwargs: Any):
+            if not _attribution_enabled("layer"):
+                return __orig(*args, **kwargs)
+            active = _nvtx_push(f"anneal.op.{__op} layer={__name} class={__cls}")
+            try:
+                return __orig(*args, **kwargs)
+            finally:
+                _nvtx_pop(active)
+
+        try:
+            module.forward = wrapped_forward
+            setattr(module, "__anneal_nvtx_wrapped__", True)
+            wrapped += 1
+        except Exception:
+            pass
+
+
+def _patch_model_runner_class(cls: Any) -> bool:
+    key = f"{getattr(cls, '__module__', '')}.{getattr(cls, '__qualname__', getattr(cls, '__name__', ''))}"
+    if key in _patched_marker_classes:
+        return False
+    patched_any = False
+    execute = getattr(cls, "execute_model", None)
+    if callable(execute) and not getattr(execute, "__anneal_nvtx_wrapped__", False):
+        @functools.wraps(execute)
+        def execute_wrapper(self: Any, *args: Any, __orig=execute, **kwargs: Any):
+            if _attribution_enabled("layer"):
+                _wrap_model_layers_for_nvtx(getattr(self, "model", None))
+            if not _attribution_enabled("phase"):
+                return __orig(self, *args, **kwargs)
+            scheduler_output = args[0] if args else kwargs.get("scheduler_output")
+            dummy_run = bool(kwargs.get("dummy_run", False))
+            phase = _infer_scheduler_phase(scheduler_output, dummy_run=dummy_run)
+            summary = _scheduler_summary(scheduler_output)
+            phase_active = _nvtx_push(f"anneal.phase.{phase} {summary}{_runner_graph_hint(self)}")
+            op_active = False
+            if _attribution_enabled("op"):
+                op_active = _nvtx_push(f"anneal.op.execute_model phase={phase} {summary}{_runner_graph_hint(self)}")
+            try:
+                return __orig(self, *args, **kwargs)
+            finally:
+                _nvtx_pop(op_active)
+                _nvtx_pop(phase_active)
+        execute_wrapper.__anneal_nvtx_wrapped__ = True  # type: ignore[attr-defined]
+        try:
+            setattr(cls, "execute_model", execute_wrapper)
+            patched_any = True
+        except Exception:
+            pass
+
+    capture = getattr(cls, "capture_model", None)
+    if callable(capture) and not getattr(capture, "__anneal_nvtx_wrapped__", False):
+        @functools.wraps(capture)
+        def capture_wrapper(self: Any, *args: Any, __orig=capture, **kwargs: Any):
+            if _attribution_enabled("layer"):
+                _wrap_model_layers_for_nvtx(getattr(self, "model", None))
+            if not _attribution_enabled("phase"):
+                return __orig(self, *args, **kwargs)
+            phase_active = _nvtx_push(f"anneal.phase.capture{_runner_graph_hint(self)}")
+            op_active = False
+            if _attribution_enabled("op"):
+                op_active = _nvtx_push(f"anneal.op.capture_model{_runner_graph_hint(self)}")
+            try:
+                return __orig(self, *args, **kwargs)
+            finally:
+                _nvtx_pop(op_active)
+                _nvtx_pop(phase_active)
+        capture_wrapper.__anneal_nvtx_wrapped__ = True  # type: ignore[attr-defined]
+        try:
+            setattr(cls, "capture_model", capture_wrapper)
+            patched_any = True
+        except Exception:
+            pass
+
+    if patched_any:
+        _patched_marker_classes.add(key)
+    return patched_any
+
+
+def _install_nvtx_marker_patches_once() -> int:
+    patched = 0
+    with _marker_patch_lock:
+        for module in list(sys.modules.values()):
+            if module is None:
+                continue
+            mod_name = getattr(module, "__name__", "")
+            if not mod_name.startswith("vllm.v1.worker"):
+                continue
+            for obj in list(vars(module).values()):
+                try:
+                    if inspect.isclass(obj) and callable(getattr(obj, "execute_model", None)):
+                        patched += int(_patch_model_runner_class(obj))
+                except Exception:
+                    pass
+        # Existing runner instances can appear before their class module is seen
+        # by the polling loop; patch their concrete classes too.
+        for runner in _find_model_runners():
+            try:
+                patched += int(_patch_model_runner_class(runner.__class__))
+            except Exception:
+                pass
+    return patched
+
+
+def _marker_patch_loop() -> None:
+    deadline = time.time() + float(os.environ.get("ANNEAL_NVTX_PATCH_TIMEOUT_SEC", "1800"))
+    while time.time() < deadline:
+        try:
+            _install_nvtx_marker_patches_once()
+        except Exception as e:
+            logger.debug("Anneal NVTX marker patch pass failed: %s", e)
+        time.sleep(float(os.environ.get("ANNEAL_NVTX_PATCH_POLL_SEC", "2")))
+
+
+def _start_marker_patch_thread() -> None:
+    global _marker_patch_thread_started
+    if _marker_patch_thread_started:
+        return
+    _marker_patch_thread_started = True
+    thread = threading.Thread(target=_marker_patch_loop, daemon=True, name="anneal-nvtx-patcher")
+    thread.start()
+
+
+def _attribution_control_local(action: str, level: str = "phase") -> Dict[str, Any]:
+    global _nvtx_level
+    if action == "start":
+        _nvtx_level = _normalise_attribution_level(level)
+        patched = _install_nvtx_marker_patches_once()
+    elif action == "stop":
+        _nvtx_level = "off"
+        patched = 0
+    elif action == "status":
+        patched = _install_nvtx_marker_patches_once()
+    else:
+        return {"success": False, "error": f"unknown attribution action: {action}", "pid": os.getpid()}
+    return {
+        "success": True,
+        "action": action,
+        "level": _normalise_attribution_level(_nvtx_level),
+        "patched_classes": len(_patched_marker_classes),
+        "patched_this_call": patched,
+        "pid": os.getpid(),
+    }
+
+
+def _worker_attribution_control(worker: Any, action: str, level: str = "phase") -> Dict[str, Any]:
+    result = _attribution_control_local(action, level)
+    try:
+        result["worker_class"] = worker.__class__.__name__
+        runner = getattr(worker, "model_runner", None)
+        result["runner_class"] = runner.__class__.__name__ if runner else ""
+    except Exception:
+        pass
+    return result
+
+
+def _attribution_control_distributed(action: str, level: str = "phase") -> Dict[str, Any]:
+    local = _attribution_control_local(action, level)
+    if _is_ray_worker_process():
+        local["distributed"] = False
+        local["ray_worker_local"] = True
+        return local
+    targets = _get_collective_rpc_targets()
+    if targets:
+        try:
+            worker_results = targets[0].collective_rpc(_worker_attribution_control, timeout=120, args=(action, level))
+            success = all(r.get("success", False) for r in worker_results)
+            return {
+                "success": success,
+                "distributed": True,
+                "local": local,
+                "worker_results": worker_results,
+                "error": "; ".join(r.get("error", "") for r in worker_results if not r.get("success", False)),
+            }
+        except Exception as e:
+            logger.warning("Distributed attribution %s failed: %s", action, e)
+    local["distributed"] = False
+    return local
 
 
 # ── Nsight Systems support ───────────────────────────────────────────────
@@ -987,6 +1338,19 @@ class _AnnealHandler(BaseHTTPRequestHandler):
             result = _cuda_profiler_distributed("stop")
             self._send_json(result, 200 if result.get("success") else 500)
 
+        elif self.path == "/attribution/start":
+            level = body.get("level", os.environ.get("ANNEAL_NVTX_LEVEL", "phase"))
+            result = _attribution_control_distributed("start", level)
+            self._send_json(result, 200 if result.get("success") else 500)
+
+        elif self.path == "/attribution/stop":
+            result = _attribution_control_distributed("stop")
+            self._send_json(result, 200 if result.get("success") else 500)
+
+        elif self.path == "/attribution/status":
+            result = _attribution_control_distributed("status", body.get("level", "phase"))
+            self._send_json(result, 200 if result.get("success") else 500)
+
         elif self.path == "/profiler/start":
             output_dir = body.get("output_dir", "")
             if not output_dir:
@@ -1100,6 +1464,7 @@ def _bind_control_socket_when_ready() -> None:
 def start_control_socket() -> None:
     """Start the control socket in a daemon thread. Called from startup hook."""
     global _bind_thread_started
+    _start_marker_patch_thread()
     if _bind_thread_started:
         return
     _bind_thread_started = True
