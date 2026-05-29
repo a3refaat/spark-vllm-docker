@@ -3,10 +3,18 @@ set -euo pipefail
 
 SITE_PACKAGES="/usr/local/lib/python3.12/dist-packages"
 PR41797_URL="https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/41797.diff"
+MOD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 cd "$SITE_PACKAGES"
 
 echo "[fix-mimo-v2-vllm] Applying MiMo V2.5 vLLM fixes"
+
+if [ ! -f "$MOD_DIR/chat_template.jinja" ]; then
+    echo "[fix-mimo-v2-vllm] ERROR: fixed MiMo chat_template.jinja missing from mod directory: $MOD_DIR" >&2
+    exit 1
+fi
+
+echo "[fix-mimo-v2-vllm] fixed MiMo chat template available at $MOD_DIR/chat_template.jinja"
 
 # CyberTen forum note: vLLM's multimodal audio path uses soundfile + librosa,
 # not torchcodec. Keep this harmless for text-only runs and necessary for audio.
@@ -43,6 +51,233 @@ elif old in text:
     print('[fix-mimo-v2-vllm] patched Qwen3XML/MiMo streaming tool parser (#42969)')
 else:
     raise SystemExit('[fix-mimo-v2-vllm] ERROR: Qwen3XML tool parser pattern not found for PR #42969')
+PY
+
+# vLLM currently aliases the MiMo reasoning parser to Qwen3ReasoningParser.
+# That parser decides whether streaming output has already left the reasoning
+# phase by scanning the whole prompt for the last <think>/</think> token.  The
+# MiMo V2.5 template does NOT prefill <think> for thinking-on generation, but
+# the rendered prompt can contain closed <think></think> spans in tool
+# instructions and assistant history.  The generic scan then marks reasoning as
+# already ended before generation starts, so generated <think>...</think> is
+# routed through the tool parser as ordinary content.  Install a tiny MiMo
+# subclass that treats the fresh assistant generation prompt as reasoning-open
+# unless the prompt explicitly ends with the thinking-off <think></think> stub.
+echo "[fix-mimo-v2-vllm] Installing MiMo-specific reasoning parser prompt-state fix"
+cat > "$SITE_PACKAGES/vllm/reasoning/mimo_reasoning_parser.py" <<'PY'
+# SPDX-License-Identifier: Apache-2.0
+from collections.abc import Sequence
+
+from vllm.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser
+
+
+class MimoReasoningParser(Qwen3ReasoningParser):
+    """MiMo V2.5 reasoning parser.
+
+    MiMo's chat template leaves the assistant generation prompt at
+    ``<|im_start|>assistant\n`` when thinking is enabled.  Closed think tags
+    can still occur earlier in the prompt (tool instructions say
+    ``<think></think>`` and assistant history is rendered with think spans), so
+    Qwen3ReasoningParser.is_reasoning_end(prompt_ids) can return True before
+    any new assistant tokens have been generated.  That leaks generated
+    ``<think>`` text as normal content and confuses streamed tool-call parsing.
+    """
+
+    def __init__(self, tokenizer, *args, **kwargs):
+        super().__init__(tokenizer, *args, **kwargs)
+        self._assistant_generation_prefix_token_ids = tokenizer.encode(
+            "<|im_start|>assistant\n", add_special_tokens=False
+        )
+        self._assistant_thinking_disabled_suffix_token_ids = tokenizer.encode(
+            "<|im_start|>assistant\n<think></think>", add_special_tokens=False
+        )
+
+    @staticmethod
+    def _endswith(input_ids: Sequence[int], suffix: Sequence[int]) -> bool:
+        if not suffix or len(input_ids) < len(suffix):
+            return False
+        return list(input_ids[-len(suffix) :]) == list(suffix)
+
+    def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
+        # This is the prompt-time check used by vLLM before streaming starts.
+        # If generation is about to begin after the bare assistant prefix,
+        # reasoning is open even if earlier prompt text contains </think>.
+        if self._endswith(input_ids, self._assistant_generation_prefix_token_ids):
+            return False
+
+        # Thinking-off MiMo prompts end with an explicit empty reasoning span;
+        # in that case output should be routed as content/tool text immediately.
+        if self._endswith(
+            input_ids, self._assistant_thinking_disabled_suffix_token_ids
+        ):
+            return True
+
+        return super().is_reasoning_end(input_ids)
+PY
+python3 - <<'PY'
+from pathlib import Path
+path = Path('/usr/local/lib/python3.12/dist-packages/vllm/reasoning/__init__.py')
+text = path.read_text()
+old = '''    "mimo": (
+        "qwen3_reasoning_parser",
+        "Qwen3ReasoningParser",
+    ),
+'''
+new = '''    "mimo": (
+        "mimo_reasoning_parser",
+        "MimoReasoningParser",
+    ),
+'''
+if new in text:
+    print('[fix-mimo-v2-vllm] MiMo reasoning parser alias already patched')
+elif old in text:
+    path.write_text(text.replace(old, new, 1))
+    print('[fix-mimo-v2-vllm] patched MiMo reasoning parser alias')
+else:
+    raise SystemExit('[fix-mimo-v2-vllm] ERROR: MiMo reasoning parser alias pattern not found')
+PY
+
+# Harden Qwen3XML/MiMo streaming deltas for OpenAI-compatible clients.  The
+# parser emits terminal tool-call deltas with name=None and arguments=""; some
+# clients/frontends treat those as separate empty calls (displayed as {}).  Also
+# avoid constructing DeltaMessage(tool_calls=[]) for ordinary text chunks,
+# because Pydantic marks the empty list as explicitly set and serializes it.
+python3 - <<'PY'
+from pathlib import Path
+path = Path('/usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/qwen3xml_tool_parser.py')
+if not path.exists():
+    print('[fix-mimo-v2-vllm] qwen3xml tool parser not present; skipping empty-delta hardening')
+    raise SystemExit
+text = path.read_text()
+orig = text
+old = '''        return DeltaMessage(
+            content=merged_content if merged_content else None,
+            tool_calls=merged_tool_calls,
+        )
+'''
+new = '''        kwargs = {}
+        if merged_content:
+            kwargs["content"] = merged_content
+        if merged_tool_calls:
+            kwargs["tool_calls"] = merged_tool_calls
+        return DeltaMessage(**kwargs)
+'''
+if new not in text:
+    if old not in text:
+        raise SystemExit('[fix-mimo-v2-vllm] ERROR: Qwen3XML merge return pattern not found')
+    text = text.replace(old, new, 1)
+old = '''        elif name.startswith("function") or name == "function":
+            # if there are parameters, close JSON object
+            if self.parameters:
+'''
+new = '''        elif name.startswith("function") or name == "function":
+            # Ignore malformed/empty <function> blocks that never provided a
+            # name; otherwise a bare <tool_call></tool_call> can become an
+            # empty OpenAI tool call with `{}` arguments.
+            if not self.current_function_name:
+                self.current_function_open = False
+                return
+
+            # if there are parameters, close JSON object
+            if self.parameters:
+'''
+if new not in text:
+    if old not in text:
+        raise SystemExit('[fix-mimo-v2-vllm] ERROR: Qwen3XML function-end guard pattern not found')
+    text = text.replace(old, new, 1)
+old = '''        # Parse the delta text and get the result
+        delta = self.parser.parse_single_streaming_chunks(delta_text)
+
+        # Update tool call tracking arrays based on incremental parsing results
+        if delta and delta.tool_calls:
+'''
+new = '''        # Parse the delta text and get the result
+        delta = self.parser.parse_single_streaming_chunks(delta_text)
+
+        # Drop terminal no-op tool-call deltas.  They carry no name and no
+        # argument bytes; retaining them makes less defensive clients create a
+        # second empty tool call.
+        if delta and delta.tool_calls:
+            meaningful_tool_calls = []
+            for tool_call in delta.tool_calls:
+                function = tool_call.function
+                if function and (function.name is not None or function.arguments not in (None, "")):
+                    meaningful_tool_calls.append(tool_call)
+            if len(meaningful_tool_calls) != len(delta.tool_calls):
+                delta.tool_calls = meaningful_tool_calls
+
+        # Update tool call tracking arrays based on incremental parsing results
+        if delta and delta.tool_calls:
+'''
+if new not in text:
+    if old not in text:
+        raise SystemExit('[fix-mimo-v2-vllm] ERROR: Qwen3XML streaming filter insertion pattern not found')
+    text = text.replace(old, new, 1)
+if text != orig:
+    path.write_text(text)
+    print('[fix-mimo-v2-vllm] hardened Qwen3XML/MiMo streaming empty tool-call deltas')
+else:
+    print('[fix-mimo-v2-vllm] Qwen3XML/MiMo streaming empty-delta hardening already patched')
+PY
+
+# Optional MiMo reasoning budget default.  Some clients (including agent
+# frontends) can enable reasoning but do not send vLLM's top-level
+# `thinking_token_budget` request parameter.  Once the parser is correctly
+# keeping generated <think> text in reasoning, MiMo may spend the full
+# max_new_tokens budget in repetitive reasoning.  If
+# MIMO_DEFAULT_THINKING_TOKEN_BUDGET is set, apply it only when the client did
+# not provide an explicit budget.  This does not remove prior reasoning from
+# the prompt; it only forces the current generation to close </think>.
+python3 - <<'PY'
+from pathlib import Path
+path = Path('/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/chat_completion/serving.py')
+if not path.exists():
+    print('[fix-mimo-v2-vllm] chat completion serving.py not present; skipping default thinking budget patch')
+    raise SystemExit
+text = path.read_text()
+orig = text
+if 'import os\n' not in text.split('import time\n', 1)[0] + 'import time\n':
+    text = text.replace('import json\nimport time\n', 'import json\nimport os\nimport time\n', 1)
+old = '''            sampling_params: SamplingParams | BeamSearchParams
+            if request.use_beam_search:
+'''
+new = '''            default_thinking_token_budget = os.environ.get(
+                "MIMO_DEFAULT_THINKING_TOKEN_BUDGET", ""
+            )
+            if (
+                default_thinking_token_budget
+                and request.thinking_token_budget is None
+                and request.include_reasoning
+                and reasoning_parser is not None
+            ):
+                try:
+                    parsed_default_thinking_token_budget = int(
+                        default_thinking_token_budget
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "MIMO_DEFAULT_THINKING_TOKEN_BUDGET must be a "
+                        "non-negative integer"
+                    ) from exc
+                if parsed_default_thinking_token_budget < 0:
+                    raise ValueError(
+                        "MIMO_DEFAULT_THINKING_TOKEN_BUDGET must be a "
+                        "non-negative integer"
+                    )
+                request.thinking_token_budget = parsed_default_thinking_token_budget
+
+            sampling_params: SamplingParams | BeamSearchParams
+            if request.use_beam_search:
+'''
+if new not in text:
+    if old not in text:
+        raise SystemExit('[fix-mimo-v2-vllm] ERROR: serving.py sampling params anchor not found for thinking budget default')
+    text = text.replace(old, new, 1)
+if text != orig:
+    path.write_text(text)
+    print('[fix-mimo-v2-vllm] patched OpenAI chat serving default MiMo thinking budget')
+else:
+    print('[fix-mimo-v2-vllm] OpenAI chat serving default MiMo thinking budget already patched')
 PY
 
 # Some current vLLM builds have the MiMo V2 model class but not a HF config
@@ -546,6 +781,12 @@ find "$SITE_PACKAGES/vllm" -name __pycache__ -type d -prune -exec rm -rf {} + 2>
 python3 - <<'PY'
 import importlib.util
 assert importlib.util.find_spec('vllm.v1.attention.backends.triton_attn_diffkv'), 'TRITON_ATTN_DIFFKV not installed'
+from vllm.reasoning import ReasoningParserManager
+assert ReasoningParserManager.lazy_parsers.get('mimo') == (
+    'vllm.reasoning.mimo_reasoning_parser',
+    'MimoReasoningParser',
+), ReasoningParserManager.lazy_parsers.get('mimo')
+assert importlib.util.find_spec('vllm.reasoning.mimo_reasoning_parser'), 'MiMo reasoning parser not installed'
 from vllm.transformers_utils.config import _CONFIG_REGISTRY
 assert 'mimo_v2' in _CONFIG_REGISTRY, 'mimo_v2 config registry entry missing'
 from vllm.config.speculative import SpeculativeConfig

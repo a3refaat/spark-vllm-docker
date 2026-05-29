@@ -6,7 +6,12 @@
 # Applied from CyberTen's NVIDIA forum notes for MiMo V2.5 on GB10:
 #   - Ray V2 executor for cross-node stability.
 #   - MiMo parsers; never use qwen3 parser for MiMo reasoning/tool calls.
-#   - PR #42969 parser cleanup for streamed MiMo/Qwen3XML tool-call deltas.
+#   - Runtime MiMo reasoning prompt-state fix and fixed MiMo chat template:
+#     preserve real prior reasoning, avoid synthetic empty think blocks in
+#     history, prefill <think> for thinking-on turns, and soften tool/final
+#     answer transition instructions.
+#   - PR #42969 parser cleanup plus empty-delta hardening for streamed
+#     MiMo/Qwen3XML tool-call deltas.
 #   - PR #41797 / TRITON_ATTN_DIFFKV fallback for MiMoV2 DiffKV attention on
 #     sm_121a where FA3/FA4 is unavailable.
 #   - MTP-2 is enabled for speculative decoding; the runtime mod patches the
@@ -54,13 +59,16 @@ defaults:
   tensor_parallel: 2
   pipeline_parallel: 1
   gpu_memory_utilization: 0.86
-  max_model_len: 131072
+  max_model_len: 196608
   max_num_batched_tokens: 16384
+  max_num_seqs: 2
   # Default/server-wide generation cap. vLLM expects max_new_tokens here and
   # converts it to SamplingParams.max_tokens. Keep this comfortably below the
   # context window so long prompts still have room for output.
-  max_new_tokens: 8192
-
+  max_new_tokens: 16384
+  # Mild anti-looping pressure. Keep this conservative: high values can degrade
+  # exact XML/JSON tool-call formatting and short factual answers.
+  repetition_penalty: 1.05
 
 env:
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
@@ -77,18 +85,27 @@ env:
   VLLM_NVFP4_GEMM_BACKEND: flashinfer-cutlass
   VLLM_USE_FLASHINFER_MOE_FP4: "1"
   VLLM_FLASHINFER_MOE_BACKEND: throughput
+  # Server-side fallback for clients that enable MiMo reasoning but cannot send
+  # vLLM's top-level `thinking_token_budget` request parameter.  This preserves
+  # keep_all_reasoning history while forcing a </think> after the budget so an
+  # agent turn cannot spend the entire max_new_tokens window in reasoning.
+  # Raise, lower, or remove this recipe env value as needed.
+  MIMO_DEFAULT_THINKING_TOKEN_BUDGET: "4096"
 
 command: |
   vllm serve lukealonso/MiMo-V2.5-NVFP4 \
       --served-model-name {served_model_name} \
       --trust-remote-code \
       --dtype auto \
-      --kv-cache-dtype fp8_e4m3 \
+      --kv-cache-dtype bfloat16 \
       --block-size 64 \
       --attention-backend triton_attn_diffkv \
       --hf-overrides '{{"architectures":["MiMoV2OmniForCausalLM"]}}' \
+      --chat-template /workspace/mods/fix-mimo-v2-vllm/chat_template.jinja \
+      --default-chat-template-kwargs '{{"keep_all_reasoning":true}}' \
+      --reasoning-config '{{"reasoning_start_str": "<think>", "reasoning_end_str": "</think>"}}' \
       --generation-config vllm \
-      --override-generation-config '{{"temperature":1.0,"top_p":0.95,"max_new_tokens":{max_new_tokens}}}' \
+      --override-generation-config '{{"temperature":1.0,"top_p":0.95,"repetition_penalty":{repetition_penalty},"max_new_tokens":{max_new_tokens}}}' \
       --limit-mm-per-prompt '{{"image":4,"video":1,"audio":1}}' \
       --host {host} \
       --port {port} \
@@ -96,9 +113,9 @@ command: |
       --pipeline-parallel-size {pipeline_parallel} \
       --distributed-executor-backend ray \
       --speculative-config '{{"method":"mtp","num_speculative_tokens":2}}' \
-      --no-async-scheduling \
       --gpu-memory-utilization {gpu_memory_utilization} \
       --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
       --max-num-batched-tokens {max_num_batched_tokens} \
       --enable-prefix-caching \
       --enable-chunked-prefill \
