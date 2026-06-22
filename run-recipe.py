@@ -406,6 +406,35 @@ def check_model_exists(model: str) -> bool:
     return False
 
 
+def check_model_complete(model: str) -> tuple[bool, list[Path]]:
+    """
+    Check if a model's HuggingFace cache blobs are fully downloaded.
+
+    Looks for .incomplete blob files which indicate an in-progress or
+    interrupted download. Returns False if the blobs directory does not
+    exist (model was never downloaded).
+
+    NOTE: vLLM's internal snapshot_download runs *inside* the container,
+    so if the container is stopped mid-download the .incomplete blobs remain
+    on the host via the HF cache volume mount. The service cannot self-heal —
+    run hf-download.sh on the HOST to complete the download.
+
+    Args:
+        model: HuggingFace model ID (e.g., 'org/model-name')
+
+    Returns:
+        Tuple of (is_complete, list_of_incomplete_blob_paths).
+        is_complete is False if any .incomplete files exist or blobs dir is missing.
+    """
+    hf_home = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
+    cache_name = f"models--{model.replace('/', '--')}"
+    blobs_path = hf_home / "hub" / cache_name / "blobs"
+    if not blobs_path.exists():
+        return False, []
+    incomplete = sorted(blobs_path.glob("*.incomplete"))
+    return len(incomplete) == 0, incomplete
+
+
 def generate_launch_script(
     recipe: dict[str, Any],
     overrides: dict[str, Any],
@@ -1162,6 +1191,25 @@ Examples:
     # --- Run Phase ---
     if args.build_only or args.download_only:
         return 0
+
+    # Pre-flight: refuse to launch if model blobs are incomplete.
+    # Prevents vLLM from loading truncated weights or deadlocking on
+    # snapshot_download inside the container. Complete the download with
+    # hf-download.sh on the HOST before restarting the service.
+    if model and not args.dry_run:
+        is_complete, incomplete_files = check_model_complete(model)
+        if not is_complete:
+            print(f"ERROR: Model '{model}' cannot be started.")
+            if incomplete_files:
+                print(f"  {len(incomplete_files)} incomplete shard(s) found in the HF cache blob store.")
+                print("  An in-progress or interrupted download left .incomplete files.")
+            else:
+                print("  No downloaded blobs found for this model.")
+            print()
+            print("Complete the download on the HOST (not inside the container):")
+            print(f"  cd {SCRIPT_DIR} && ./hf-download.sh {model}")
+            print("Then restart the service.")
+            return 1
 
     # Check if image exists (if not using --setup)
     if not args.dry_run and not args.setup and not check_image_exists(container):

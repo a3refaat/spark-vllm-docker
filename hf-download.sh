@@ -143,9 +143,13 @@ fi
 START_TIME=$(date +%s)
 
 # Download model
+# HF_HUB_DISABLE_XET=1: disable XetHub chunk-parallel backend (~30 connections/file)
+#   and fall back to standard HTTP (1 connection/file).
+# --max-workers 16: download up to 16 shard files simultaneously.
+# Combined result: ~16 total connections instead of 250+.
 echo "Downloading model '$MODEL_NAME' using uvx..."
 DOWNLOAD_START=$(date +%s)
-if uvx hf download "$MODEL_NAME"; then
+if HF_HUB_DISABLE_XET=1 uvx hf download --max-workers 16 "$MODEL_NAME"; then
     DOWNLOAD_END=$(date +%s)
     DOWNLOAD_TIME=$((DOWNLOAD_END - DOWNLOAD_START))
     printf "Download completed in %02d:%02d:%02d\n" $((DOWNLOAD_TIME/3600)) $((DOWNLOAD_TIME%3600/60)) $((DOWNLOAD_TIME%60))
