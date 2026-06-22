@@ -5,7 +5,7 @@
 #   make download-missing  — download any missing/incomplete models
 #   make download-all      — (re-)download every recipe model
 #
-# Requires: python3, pyyaml, uvx (installed by Ansible into /opt/uv)
+# Requires: python3, pyyaml, uvx (installed by Ansible to /usr/local/bin)
 #
 # Run as vllm:
 #   sudo -u vllm make status
