@@ -92,6 +92,12 @@ export CONFIG_FILE CONFIG_FILE_SET
 # Source autodiscover.sh to load .env (for DOTENV_COPY_HOSTS) and make detection functions available
 source "$(dirname "$0")/autodiscover.sh"
 
+# Pick up HF token from .env (stored as CONTAINER_HF_TOKEN) if not already in environment.
+# Ansible writes CONTAINER_HF_TOKEN to .env; autodiscover.sh loads it as DOTENV_CONTAINER_HF_TOKEN.
+if [[ -z "${HF_TOKEN:-}" && -n "${DOTENV_CONTAINER_HF_TOKEN:-}" ]]; then
+    export HF_TOKEN="$DOTENV_CONTAINER_HF_TOKEN"
+fi
+
 # Validate model name is provided
 if [ -z "${MODEL_NAME:-}" ]; then
     echo "Error: Model name is required."

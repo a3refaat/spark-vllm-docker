@@ -89,6 +89,7 @@ import subprocess
 import shlex
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -1209,6 +1210,7 @@ Examples:
             print("Complete the download on the HOST (not inside the container):")
             print(f"  cd {SCRIPT_DIR} && ./hf-download.sh {model}")
             print("Then restart the service.")
+            time.sleep(60)  # keep error visible in journal; slows down systemd restart loop
             return 1
 
     # Check if image exists (if not using --setup)
