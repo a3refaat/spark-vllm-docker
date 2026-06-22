@@ -1217,12 +1217,17 @@ Examples:
     if not args.dry_run and not args.setup and not check_image_exists(container):
         print(f"Container image '{container}' not found locally.")
         print()
-        print("Options:")
-        print(f"  1. Use --setup to build and run")
-        print(f"  2. Build manually: ./build-and-copy.sh -t {container}")
-        print()
-        response = input("Build now? [y/N] ").strip().lower()
-        if response == "y":
+        if sys.stdin.isatty():
+            print("Options:")
+            print(f"  1. Use --setup to build and run")
+            print(f"  2. Build manually: ./build-and-copy.sh -t {container}")
+            print()
+            response = input("Build now? [y/N] ").strip().lower()
+            build_it = response == "y"
+        else:
+            print("Running non-interactively — building image automatically...")
+            build_it = True
+        if build_it:
             if not build_image(container, copy_targets, build_args):
                 print("Error: Failed to build image")
                 return 1
