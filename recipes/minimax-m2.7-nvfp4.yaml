@@ -1,0 +1,53 @@
+# Recipe: MiniMax-M2.7-NVFP4 (NVIDIA official quantization)
+# nvidia/MiniMax-M2.7-NVFP4 — ModelOpt v0.43.0, NVFP4, calibrated on cnn_dailymail + Nemotron
+# 230B total / 10B active MoE, ~150 GB on disk, ~75 GB/node at TP=2
+# SM121 fix: TRITON_ATTN + marlin MoE (CUTLASS FP4 produces silent garbage on GB10)
+
+recipe_version: "1"
+name: MiniMax-M2.7-NVFP4
+description: vLLM serving nvidia/MiniMax-M2.7-NVFP4 with Ray distributed backend
+
+# HuggingFace model to download (optional, for --download-model)
+model: nvidia/MiniMax-M2.7-NVFP4
+
+# Container image to use
+container: vllm-node
+
+# Can only be run in a cluster
+cluster_only: true
+
+# No mods required — official nvidia quantization
+mods: []
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.87
+  max_model_len: 65536
+
+# SM121 NVFP4 required env vars — Marlin dequant path, no CUTLASS FP4
+env:
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
+  VLLM_NVFP4_GEMM_BACKEND: marlin
+  VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+
+# The vLLM serve command template
+command: |
+  vllm serve nvidia/MiniMax-M2.7-NVFP4 \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend ray \
+      --max-model-len {max_model_len} \
+      --kv-cache-dtype fp8 \
+      --enable-prefix-caching \
+      --load-format fastsafetensors \
+      --enable-auto-tool-choice \
+      --tool-call-parser minimax_m2 \
+      --reasoning-parser minimax_m2_append_think \
+      --attention-backend TRITON_ATTN \
+      --moe-backend marlin
