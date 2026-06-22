@@ -142,6 +142,17 @@ fi
 # Start time tracking
 START_TIME=$(date +%s)
 
+# Acquire a per-model exclusive lock so that two simultaneous calls for the
+# same model (e.g. a Makefile 'make download-all' and a manual invocation)
+# don't race on the same HF cache temp files.
+MODEL_SLUG="${MODEL_NAME//\//-}"
+LOCK_FILE="/tmp/hf-download-${MODEL_SLUG}.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9 2>/dev/null; then
+    echo "Another hf-download is already running for '$MODEL_NAME'. Waiting for it to finish..."
+    flock 9
+fi
+
 # Download model
 # HF_HUB_DISABLE_XET=1: disable XetHub chunk-parallel backend (~30 connections/file)
 #   and fall back to standard HTTP (1 connection/file).
