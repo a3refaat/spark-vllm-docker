@@ -145,18 +145,32 @@ START_TIME=$(date +%s)
 # Download model
 # HF_HUB_DISABLE_XET=1: disable XetHub chunk-parallel backend (~30 connections/file)
 #   and fall back to standard HTTP (1 connection/file).
-# --max-workers 16: download up to 16 shard files simultaneously.
-# Combined result: ~16 total connections instead of 250+.
+# --max-workers 4: download up to 4 shard files simultaneously (was 16; large-shard
+#   CDN truncation was observed consistently at --max-workers 16).
+# Retry logic: on first failure fall back to --max-workers 1 (serial) which may
+#   route to a different CDN edge and avoid a cached-truncated-shard.
 echo "Downloading model '$MODEL_NAME' using uvx..."
 DOWNLOAD_START=$(date +%s)
-if HF_HUB_DISABLE_XET=1 uvx hf download --max-workers 16 "$MODEL_NAME"; then
-    DOWNLOAD_END=$(date +%s)
-    DOWNLOAD_TIME=$((DOWNLOAD_END - DOWNLOAD_START))
-    printf "Download completed in %02d:%02d:%02d\n" $((DOWNLOAD_TIME/3600)) $((DOWNLOAD_TIME%3600/60)) $((DOWNLOAD_TIME%60))
-else
-    echo "Error: Failed to download model '$MODEL_NAME'."
+DOWNLOAD_OK=false
+MAX_WORKERS=4
+for attempt in 1 2 3; do
+    if HF_HUB_DISABLE_XET=1 uvx hf download --max-workers "$MAX_WORKERS" "$MODEL_NAME"; then
+        DOWNLOAD_OK=true
+        break
+    fi
+    if [[ $attempt -lt 3 ]]; then
+        MAX_WORKERS=1
+        echo "Download attempt $attempt failed. Retrying with --max-workers $MAX_WORKERS (serial)..."
+        sleep 15
+    fi
+done
+if [[ "$DOWNLOAD_OK" != "true" ]]; then
+    echo "Error: Failed to download model '$MODEL_NAME' after 3 attempts."
     exit 1
 fi
+DOWNLOAD_END=$(date +%s)
+DOWNLOAD_TIME=$((DOWNLOAD_END - DOWNLOAD_START))
+printf "Download completed in %02d:%02d:%02d\n" $((DOWNLOAD_TIME/3600)) $((DOWNLOAD_TIME%3600/60)) $((DOWNLOAD_TIME%60))
 
 # Determine model directory path
 # uvx hf download stores models in ~/.cache/huggingface/hub with the pattern: models--<org>--<model>-<suffix>
