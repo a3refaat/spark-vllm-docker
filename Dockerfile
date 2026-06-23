@@ -188,6 +188,7 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     cd flashinfer-cubin && uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
     # flashinfer-jit-cache
     cd ../flashinfer-jit-cache && \
+    python3 -c "from pathlib import Path; p=Path('../flashinfer/aot.py'); s=p.read_text(); needle='        jit_specs.append(gen_cutlass_fused_moe_sm120_module())\n'; replacement='        # Disabled locally: SM12x fused_moe_120 fails nvcc parse in moe_gemm_template_dispatch_tma_ws.h\n'; assert needle in s, 'target line not found in flashinfer/aot.py'; p.write_text(s.replace(needle, replacement, 1))" && \
     uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
     # dump git ref in the wheels dir
     cd .. && git rev-parse HEAD > /workspace/wheels/.flashinfer-commit
@@ -337,9 +338,10 @@ RUN set -eux; \
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     python3 use_existing_torch.py && \
     sed -i "/flashinfer/d" requirements/cuda.txt && \
-    sed -i '/^triton\b/d' requirements/test/cuda.txt && \
-    sed -i '/^fastsafetensors\b/d' requirements/test/cuda.txt && \
-    uv pip install -r requirements/build/cuda.txt
+    sed -i '/^triton\b/d' requirements/cuda.txt && \
+    sed -i '/^fastsafetensors\b/d' requirements/cuda.txt && \
+    uv pip install setuptools_scm && \
+    uv pip install -r requirements/cuda.txt
 
 # Apply Patches
 # TEMPORARY PATCH for fastsafetensors loading in cluster setup - tracking https://github.com/vllm-project/vllm/issues/34180
