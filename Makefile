@@ -14,9 +14,10 @@
 #   sudo -u vllm make download-missing
 #   sudo -u vllm make download-minimax-m2.7-nvfp4-gb10
 
-HF_HOME  ?= $(HOME)/.cache/huggingface
-HUB       = $(HF_HOME)/hub
-RECIPES   = $(wildcard recipes/*.yaml)
+HF_HOME     ?= $(HOME)/.cache/huggingface
+HUB          = $(HF_HOME)/hub
+RECIPES      = $(wildcard recipes/*.yaml)
+SCRIPTS_DIR ?= $(HOME)/scripts
 
 # Extract model checkpoints from all recipe YAML files (for bulk targets)
 MODELS := $(shell python3 -c \
@@ -43,18 +44,34 @@ download-$(1):
 
 endef
 
-$(foreach slug,$(RECIPE_SLUGS),$(eval $(call RECIPE_DOWNLOAD_RULE,$(slug))))
+# Generate a sync-<slug> target for each recipe.
+# Calls sync-model.sh which rsyncs the model dir from spark1 to spark2.
+define RECIPE_SYNC_RULE
+.PHONY: sync-$(1)
+sync-$(1):
+	@MODEL=$$$$(python3 -c "import yaml; d=yaml.safe_load(open('recipes/$(1).yaml')); print(d.get('model',''))" 2>/dev/null); \
+	[ -n "$$$$MODEL" ] || { echo "Error: no model field in recipes/$(1).yaml"; exit 1; }; \
+	$(SCRIPTS_DIR)/sync-model.sh "$$$$MODEL"
 
-.PHONY: help status download-missing download-all
+endef
+
+.PHONY: help status download-missing download-all sync-all
 
 help:
 	@echo "Per-recipe download targets:"
 	@$(foreach slug,$(RECIPE_SLUGS),echo "  make download-$(slug)";)
 	@echo ""
+	@echo "Per-recipe sync targets (rsync model spark1 → spark2):"
+	@$(foreach slug,$(RECIPE_SLUGS),echo "  make sync-$(slug)";)
+	@echo ""
 	@echo "Bulk targets:"
 	@echo "  make status           — show download state of all models"
 	@echo "  make download-missing — download only missing/incomplete models"
 	@echo "  make download-all     — (re-)download every model"
+	@echo "  make sync-all         — rsync all complete models to spark2"
+
+$(foreach slug,$(RECIPE_SLUGS),$(eval $(call RECIPE_DOWNLOAD_RULE,$(slug))))
+$(foreach slug,$(RECIPE_SLUGS),$(eval $(call RECIPE_SYNC_RULE,$(slug))))
 
 status:
 	@if [ -z "$(RECIPE_SLUGS)" ]; then echo "No recipes found in recipes/"; exit 1; fi
@@ -94,3 +111,11 @@ download-all:
 	  ./hf-download.sh "$$m" -c --copy-parallel || exit 1; \
 	done
 	@echo "All models downloaded."
+
+sync-all:
+	@if [ -z "$(RECIPE_SLUGS)" ]; then echo "No recipes found in recipes/"; exit 1; fi
+	@for slug in $(RECIPE_SLUGS); do \
+	  m=$$(python3 -c "import yaml; d=yaml.safe_load(open('recipes/'$$slug'.yaml')); print(d.get('model',''))" 2>/dev/null); \
+	  [ -n "$$m" ] && $(SCRIPTS_DIR)/sync-model.sh "$$m" || true; \
+	done
+	@echo "All models synced."

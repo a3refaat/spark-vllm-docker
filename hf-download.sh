@@ -45,7 +45,7 @@ copy_model_to_host() {
     local host_copy_start host_copy_end host_copy_time
     host_copy_start=$(date +%s)
 
-    if rsync -av --mkpath --progress "$model_dir" "${SSH_USER}@${host}:$HUB_PATH/"; then
+    if rsync -av --delete-after --mkpath --progress "$model_dir" "${SSH_USER}@${host}:$HUB_PATH/"; then
         host_copy_end=$(date +%s)
         host_copy_time=$((host_copy_end - host_copy_start))
         printf "Copy to %s completed in %02d:%02d:%02d\n" "$host" $((host_copy_time/3600)) $((host_copy_time%3600/60)) $((host_copy_time%60))
@@ -169,16 +169,20 @@ fi
 echo "Downloading model '$MODEL_NAME' using uvx..."
 DOWNLOAD_START=$(date +%s)
 DOWNLOAD_OK=false
-MAX_WORKERS=4
-for attempt in 1 2 3; do
-    if HF_HUB_DISABLE_XET=1 uvx hf download --max-workers "$MAX_WORKERS" "$MODEL_NAME"; then
+export HF_HUB_DOWNLOAD_TIMEOUT=60
+export HF_HUB_DISABLE_XET=1
+export HF_DEBUG=1
+if [ "$HF_HUB_DISABLE_XET" = 1 ]
+then
+    MAX_WORKERS=8
+else
+    export HF_XET_NUM_CONCURRENT_RANGE_GETS=4
+    MAX_WORKERS=1
+fi
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if uvx hf download --format auto --max-workers "$MAX_WORKERS" "$MODEL_NAME"; then
         DOWNLOAD_OK=true
         break
-    fi
-    if [[ $attempt -lt 3 ]]; then
-        MAX_WORKERS=1
-        echo "Download attempt $attempt failed. Retrying with --max-workers $MAX_WORKERS (serial)..."
-        sleep 15
     fi
 done
 if [[ "$DOWNLOAD_OK" != "true" ]]; then
