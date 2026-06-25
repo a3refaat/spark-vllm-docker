@@ -52,7 +52,7 @@ RUN apt update && \
 
 # Additional deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-     uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
+     uv pip install torch==2.12.0+cu130 torchvision==0.27.0+cu130 torchaudio==2.11.0+cu130 triton --index-url https://download.pytorch.org/whl/cu130 && \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2" filelock pynvml requests tqdm
 
 # Configure Ccache for CUDA/C++
@@ -154,6 +154,32 @@ RUN set -eux; \
         done; \
     fi
 
+# Remove K=128 large tiles that don't fit SM121's 101KB SMEM (Stages=1 → static_assert fail).
+# Keep only K=64 tiles + 128x128x128 (the only K=128 tile that fits with 2 stages).
+RUN sed -i 's/\[128, 128, 256\],/# REMOVED for SM121: [128, 128, 256],/' flashinfer/jit/gemm/cutlass/generate_kernels.py && \
+    sed -i 's/\[128, 256, 128\],/# REMOVED for SM121: [128, 256, 128],/' flashinfer/jit/gemm/cutlass/generate_kernels.py && \
+    sed -i 's/\[256, 128, 128\],/# REMOVED for SM121: [256, 128, 128],/' flashinfer/jit/gemm/cutlass/generate_kernels.py && \
+    echo "[OK] Removed large K=128 tiles from generate_kernels.py" && \
+    sed -i '/TileM == 128 && TileN == 128 && TileK == 256/d' \
+        csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch_tma_ws.h && \
+    sed -i '/TileM == 128 && TileN == 256 && TileK == 128/d' \
+        csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch_tma_ws.h && \
+    sed -i '/TileM == 256 && TileN == 128 && TileK == 128/d' \
+        csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch_tma_ws.h && \
+    echo "[OK] Removed large K=128 tiles from dispatch header"
+# Apply E2M1 SM121 fix: remove SM121 from CUDA_PTX_FP4FP6_CVT_ENABLED
+# SM121 (GB10) lacks cvt.rn.satfinite.e2m1x2.f32 PTX instruction
+# Reference: https://github.com/Avarok-Cybersecurity/dgx-vllm
+COPY patches/build/flashinfer_e2m1_sm121.patch .
+RUN if [ -f flashinfer_e2m1_sm121.patch ]; then \
+        if patch -p1 --dry-run --reverse < flashinfer_e2m1_sm121.patch &>/dev/null; then \
+            echo "E2M1 SM121 CUTLASS patch already applied"; \
+        else \
+            echo "Applying E2M1 SM121 CUTLASS patch..." && \
+            patch -p1 < flashinfer_e2m1_sm121.patch; \
+        fi; \
+    fi
+
 # TEMPORARY patch for flashinfer autotune and other improvements (PR 2927) - MERGED 4/3
 # RUN curl -fsL https://github.com/flashinfer-ai/flashinfer/pull/2927.diff -o pr2927.diff \
 #     && if git apply --reverse --check pr2927.diff 2>/dev/null; then \
@@ -177,6 +203,7 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     cd flashinfer-cubin && uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
     # flashinfer-jit-cache
     cd ../flashinfer-jit-cache && \
+    python3 -c "from pathlib import Path; p=Path('../flashinfer/aot.py'); s=p.read_text(); needle='        jit_specs.append(gen_cutlass_fused_moe_sm120_module())\n'; replacement='        # Disabled locally: SM12x fused_moe_120 fails nvcc parse in moe_gemm_template_dispatch_tma_ws.h\n'; assert needle in s, 'target line not found in flashinfer/aot.py'; p.write_text(s.replace(needle, replacement, 1))" && \
     uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
     # dump git ref in the wheels dir
     cd .. && git rev-parse HEAD > /workspace/wheels/.flashinfer-commit
@@ -433,9 +460,10 @@ PY
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     python3 use_existing_torch.py && \
     sed -i "/flashinfer/d" requirements/cuda.txt && \
-    sed -i '/^triton\b/d' requirements/test/cuda.txt && \
-    sed -i '/^fastsafetensors\b/d' requirements/test/cuda.txt && \
-    uv pip install -r requirements/build/cuda.txt
+    sed -i '/^triton\b/d' requirements/cuda.txt && \
+    sed -i '/^fastsafetensors\b/d' requirements/cuda.txt && \
+    uv pip install setuptools_scm && \
+    uv pip install -r requirements/cuda.txt
 
 # Apply Patches
 # TEMPORARY PATCH for fastsafetensors loading in cluster setup - tracking https://github.com/vllm-project/vllm/issues/34180
@@ -515,7 +543,7 @@ ARG PRE_TRANSFORMERS=0
 
 # Install deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-     uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
+     uv pip install torch==2.12.0+cu130 torchvision==0.27.0+cu130 torchaudio==2.11.0+cu130 triton --index-url https://download.pytorch.org/whl/cu130 && \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2"
 
 # Install wheels from host ./wheels/ (bind-mounted from build context — no layer bloat)
