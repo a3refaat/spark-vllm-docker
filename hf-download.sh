@@ -45,7 +45,7 @@ copy_model_to_host() {
     local host_copy_start host_copy_end host_copy_time
     host_copy_start=$(date +%s)
 
-    if rsync -av --mkpath --progress "$model_dir" "${SSH_USER}@${host}:$HUB_PATH/"; then
+    if rsync -av --delete-after --mkpath --progress "$model_dir" "${SSH_USER}@${host}:$HUB_PATH/"; then
         host_copy_end=$(date +%s)
         host_copy_time=$((host_copy_end - host_copy_start))
         printf "Copy to %s completed in %02d:%02d:%02d\n" "$host" $((host_copy_time/3600)) $((host_copy_time%3600/60)) $((host_copy_time%60))
@@ -91,6 +91,12 @@ export CONFIG_FILE CONFIG_FILE_SET
 
 # Source autodiscover.sh to load .env (for DOTENV_COPY_HOSTS) and make detection functions available
 source "$(dirname "$0")/autodiscover.sh"
+
+# Pick up HF token from .env (stored as CONTAINER_HF_TOKEN) if not already in environment.
+# Ansible writes CONTAINER_HF_TOKEN to .env; autodiscover.sh loads it as DOTENV_CONTAINER_HF_TOKEN.
+if [[ -z "${HF_TOKEN:-}" && -n "${DOTENV_CONTAINER_HF_TOKEN:-}" ]]; then
+    export HF_TOKEN="$DOTENV_CONTAINER_HF_TOKEN"
+fi
 
 # Validate model name is provided
 if [ -z "${MODEL_NAME:-}" ]; then
@@ -142,17 +148,50 @@ fi
 # Start time tracking
 START_TIME=$(date +%s)
 
+# Acquire a per-model exclusive lock so that two simultaneous calls for the
+# same model (e.g. a Makefile 'make download-all' and a manual invocation)
+# don't race on the same HF cache temp files.
+MODEL_SLUG="${MODEL_NAME//\//-}"
+LOCK_FILE="/tmp/hf-download-${MODEL_SLUG}.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9 2>/dev/null; then
+    echo "Another hf-download is already running for '$MODEL_NAME'. Waiting for it to finish..."
+    flock 9
+fi
+
 # Download model
+# HF_HUB_DISABLE_XET=1: disable XetHub chunk-parallel backend (~30 connections/file)
+#   and fall back to standard HTTP (1 connection/file).
+# --max-workers 4: download up to 4 shard files simultaneously (was 16; large-shard
+#   CDN truncation was observed consistently at --max-workers 16).
+# Retry logic: on first failure fall back to --max-workers 1 (serial) which may
+#   route to a different CDN edge and avoid a cached-truncated-shard.
 echo "Downloading model '$MODEL_NAME' using uvx..."
 DOWNLOAD_START=$(date +%s)
-if uvx hf download "$MODEL_NAME"; then
-    DOWNLOAD_END=$(date +%s)
-    DOWNLOAD_TIME=$((DOWNLOAD_END - DOWNLOAD_START))
-    printf "Download completed in %02d:%02d:%02d\n" $((DOWNLOAD_TIME/3600)) $((DOWNLOAD_TIME%3600/60)) $((DOWNLOAD_TIME%60))
+DOWNLOAD_OK=false
+export HF_HUB_DOWNLOAD_TIMEOUT=60
+export HF_HUB_DISABLE_XET=1
+export HF_DEBUG=1
+if [ "$HF_HUB_DISABLE_XET" = 1 ]
+then
+    MAX_WORKERS=8
 else
-    echo "Error: Failed to download model '$MODEL_NAME'."
+    export HF_XET_NUM_CONCURRENT_RANGE_GETS=4
+    MAX_WORKERS=1
+fi
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if uvx hf download --format auto --max-workers "$MAX_WORKERS" "$MODEL_NAME"; then
+        DOWNLOAD_OK=true
+        break
+    fi
+done
+if [[ "$DOWNLOAD_OK" != "true" ]]; then
+    echo "Error: Failed to download model '$MODEL_NAME' after 3 attempts."
     exit 1
 fi
+DOWNLOAD_END=$(date +%s)
+DOWNLOAD_TIME=$((DOWNLOAD_END - DOWNLOAD_START))
+printf "Download completed in %02d:%02d:%02d\n" $((DOWNLOAD_TIME/3600)) $((DOWNLOAD_TIME%3600/60)) $((DOWNLOAD_TIME%60))
 
 # Determine model directory path
 # uvx hf download stores models in ~/.cache/huggingface/hub with the pattern: models--<org>--<model>-<suffix>
