@@ -36,8 +36,9 @@ Similarly, `--rebuild-flashinfer`, `--flashinfer-ref`, and `--apply-flashinfer-p
 
 ## MINIMAX-M3 DEPLOYMENT PACKAGE (2xGB10)
 
-To serve `Sebesky/MiniMax-M3-W4A16-GPTQ` across two DGX Sparks with EAGLE3
-speculative decoding and quantized KV (b12x fp8 / b12x nvfp4 / KVarN k4v2),
+To serve `Sebesky/MiniMax-M3-W4A16-GPTQ` across two DGX Sparks with
+quantized KV (b12x fp8 / b12x nvfp4 / KVarN k4v2) and EAGLE3 speculative
+decoding on the b12x recipes,
 see **[DEPLOYMENT.md](DEPLOYMENT.md)** — one-command image build
 (`./build-deploy.sh`) plus three production recipes.
 

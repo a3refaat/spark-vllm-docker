@@ -1,8 +1,8 @@
 # MiniMax-M3-W4A16-GPTQ on 2x DGX Spark (GB10) — Deployment Package
 
 Serve [`Sebesky/MiniMax-M3-W4A16-GPTQ`](https://huggingface.co/Sebesky/MiniMax-M3-W4A16-GPTQ)
-(Marlin W4A16 MoE) across two GB10 nodes at TP2, with EAGLE3 speculative
-decoding and a choice of three quantized-KV attention stacks. One container
+(Marlin W4A16 MoE) across two GB10 nodes at TP2, with a choice of three
+quantized-KV attention stacks (EAGLE3 speculative decoding on the b12x two). One container
 image backs all recipes; the per-recipe vLLM integration mods are applied
 into the fresh container at launch, so mutually-exclusive stacks (b12x vs
 KVarN) never collide.
@@ -13,16 +13,21 @@ KVarN) never collide.
 |---|---|---|---|---|
 | `minimax-m3-w4a16-gptq-b12x-fp8-eagle3` | fp8 | b12x (CuTe-DSL/Triton, SM121) | 131k | ~34 t/s @60k, accept 2.96 tok/step |
 | `minimax-m3-w4a16-gptq-b12x-nvfp4-eagle3` | nvfp4 | b12x, draft KV also nvfp4 | 196k | densest b12x KV (~72 B/head) |
-| `minimax-m3-w4a16-gptq-kvarn-eagle3` | KVarN k4v2 (4-bit K / 2-bit V) | stock vLLM Triton + PR #46812 backport | 131k | 39.7/30.4/26.4 t/s @512/65k/120k, 170,752-token KV pool, accept 78.6% @120k |
+| `minimax-m3-w4a16-gptq-kvarn` | KVarN k4v2 (4-bit K / 2-bit V) | stock vLLM Triton + PR #46812 backport | 131k | 243k-314k-token KV pool (~2x concurrency @131k), 23.1/21.4 t/s @512/65k, no drafter |
 
 All three: reasoning parser + tool calling (`minimax_m3`), thinking mode on,
-`FULL_DECODE_ONLY` cuda graphs, EAGLE3 draft at TP2 with `spec_tokens: 3`.
-Benchmark narratives: `runs/baselines/SUMMARY.md`, `runs/eagle3-20260702/REPORT.md`.
+`FULL_DECODE_ONLY` cuda graphs. The b12x pair adds EAGLE3 (draft at TP2,
+`spec_tokens: 3`). Benchmark narratives: `runs/baselines/SUMMARY.md`,
+`runs/eagle3-20260702/REPORT.md`.
 
 Which one?
-- **kvarn-eagle3** — best measured decode speed and KV density; everything is
-  stock Triton + the KVarN backport (no CuTe DSL in the hot path).
-- **b12x-fp8-eagle3** — the conservative quantization (fp8 KV everywhere).
+- **kvarn** — densest KV / most concurrent context; everything is stock
+  Triton + the KVarN backport (no CuTe DSL in the hot path); no drafter to
+  download. (An EAGLE3 variant of this stack — ~1.5-1.9x faster decode at
+  reduced KV capacity — lives in git history as
+  `minimax-m3-w4a16-gptq-kvarn-eagle3.yaml`.)
+- **b12x-fp8-eagle3** — fastest decode with conservative quantization (fp8
+  KV everywhere).
 - **b12x-nvfp4-eagle3** — maximum context per byte on the b12x stack.
 
 ## Prerequisites
@@ -55,9 +60,9 @@ it is pure Python/JIT — no wheel builds, no dependency changes.
 ./hf-download.sh Sebesky/MiniMax-M3-W4A16-GPTQ -c <worker-ip>
 ```
 
-### EAGLE3 drafter
+### EAGLE3 drafter (b12x recipes only)
 
-The recipes pull the int4-RTN EAGLE3 drafter (single Llama-style decoder
+The b12x recipes pull the int4-RTN EAGLE3 drafter (single Llama-style decoder
 block, ~1.6 GB, embed_tokens/lm_head quantized too) from
 [`Sebesky/MiniMax-M3-EAGLE3-RTN-INT4`](https://huggingface.co/Sebesky/MiniMax-M3-EAGLE3-RTN-INT4)
 via the recipes' `drafter_model:` default. Prefetching to both nodes is
@@ -77,7 +82,7 @@ config.
 
 ```bash
 # recommended first run
-./run-recipe.sh --no-ray -d recipes/minimax-m3-w4a16-gptq-kvarn-eagle3.yaml
+./run-recipe.sh --no-ray -d recipes/minimax-m3-w4a16-gptq-kvarn.yaml
 
 # or the b12x variants
 ./run-recipe.sh --no-ray -d recipes/minimax-m3-w4a16-gptq-b12x-fp8-eagle3.yaml
@@ -113,7 +118,8 @@ need a power cycle:
    0.935+ passes or fails depending on boot-to-boot page-cache state. A
    failure is a clean `ValueError` (safe to retry), but 0.93 just works.
 3. **Drop page caches on BOTH nodes before a launch**, never during/after
-   model load (`instanttensor` weights are file-backed and must stay cached):
+   model load (page cache backs the load path; evicting it mid-load
+   thrashes, and it is fatal under the `instanttensor` load format):
    ```bash
    sync && echo 3 | sudo tee /proc/sys/vm/drop_caches   # on each node
    ```
@@ -130,12 +136,16 @@ need a power cycle:
 `run-recipe.sh` accepts `--max-model-len`, `--gpu-mem`, `--tp`, `--port`
 overrides directly; everything else is edited under the recipe's `defaults:`.
 
-- `max_model_len` — KVarN\@131k leaves ~1.3x concurrency headroom; the KVarN
-  stack without the drafter profiles to ~224k if you trade EAGLE3 away
-  (`runs/baselines/SUMMARY.md` has the accounting).
-- `max_num_batched_tokens` (1024) — raising to 2048 speeds long-prompt
-  prefill but costs ~0.75 GiB of KV via the profiling peak.
-- `spec_tokens` (3) — validated sweet spot; 4 was model-rejected.
+- `max_model_len` — the KVarN recipe @131k leaves ~2x concurrency headroom,
+  and the accounting says ~196k-224k fits (boot-sensitive, not
+  serving-validated; failures are clean startup ValueErrors —
+  `runs/baselines/SUMMARY.md`). The b12x-eagle3 recipes are tighter: the
+  drafter costs ~2 GiB.
+- `max_num_batched_tokens` — 2048 (kvarn) vs 1024 (b12x-eagle3): higher is
+  faster long-prompt prefill but costs ~0.75 GiB of KV via the profiling
+  peak.
+- `spec_tokens` (3, b12x recipes) — validated sweet spot; 4 was
+  model-rejected.
 
 ## Layout of the package
 

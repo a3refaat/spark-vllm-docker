@@ -14,7 +14,7 @@
 #   ./build-deploy.sh --skip-base           # only rebuild the b12x layer
 #
 # After building, serve with any production recipe, e.g.:
-#   ./run-recipe.sh --no-ray -d recipes/minimax-m3-w4a16-gptq-kvarn-eagle3.yaml
+#   ./run-recipe.sh --no-ray -d recipes/minimax-m3-w4a16-gptq-kvarn.yaml
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -58,4 +58,4 @@ fi
 
 echo "== done: $DEPLOY_TAG"
 echo "   next: ./hf-download.sh Sebesky/MiniMax-M3-W4A16-GPTQ  (plus the EAGLE3 drafter, see DEPLOYMENT.md)"
-echo "         ./run-recipe.sh --no-ray -d recipes/minimax-m3-w4a16-gptq-kvarn-eagle3.yaml"
+echo "         ./run-recipe.sh --no-ray -d recipes/minimax-m3-w4a16-gptq-kvarn.yaml"

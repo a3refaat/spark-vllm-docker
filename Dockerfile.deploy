@@ -10,7 +10,7 @@
 #
 #   recipes/minimax-m3-w4a16-gptq-b12x-fp8-eagle3.yaml    fp8 KV,   b12x + EAGLE3
 #   recipes/minimax-m3-w4a16-gptq-b12x-nvfp4-eagle3.yaml  nvfp4 KV, b12x + EAGLE3
-#   recipes/minimax-m3-w4a16-gptq-kvarn-eagle3.yaml       KVarN k4v2, stock Triton + EAGLE3
+#   recipes/minimax-m3-w4a16-gptq-kvarn.yaml              KVarN k4v2, stock Triton, no drafter
 #
 # This Dockerfile bakes the parts that are recipe-INDEPENDENT:
 #   * base: vLLM @ g979b56a66 built from source with the minimax-m3-fused-fp8-kv
