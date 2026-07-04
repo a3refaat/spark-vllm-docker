@@ -1,0 +1,109 @@
+# Recipe: MiniMax-M3-W4A16-GPTQ + b12x fp8 stack + EAGLE3 (fp8 DRAFT KV)
+#
+# The b12x fp8 target stack (sparse layers fp8 MSA + fp8 indexer, dense layers
+# 0-2 b12x dense fp8, fused fp8 write, scheduled single-row decode) PLUS EAGLE3
+# speculative decoding -- with the draft running on the SAME b12x backend and
+# the SAME fp8 KV cache (descale buffers sized for verify rows; the OOB-read
+# coherence bug is fixed at b12x commit 3d87693, baked into the image).
+#
+# WHY: decode is weight-bandwidth bound, so EAGLE's token-amortization is the
+# real throughput lever. The M3-EAGLE draft is a single Llama decoder block
+# with FULL MHA (64 KV heads x 128); the b12x dense backend serves it on the
+# global fp8 cache dtype directly -- no TRITON_ATTN pin for the draft.
+#
+# IMAGE: vllm-node-minimax-m3-b12x (Dockerfile.deploy / build-deploy.sh).
+
+recipe_version: "1"
+name: MiniMax-M3-W4A16-GPTQ-b12x-fp8-eagle3
+description: MiniMax-M3 GPTQ W4A16 dual Spark/GB10 TP2; b12x fp8 target (MSA+indexer+dense) + EAGLE3 spec decode with fp8 DRAFT KV on the b12x dense backend, Marlin int4 MoE
+
+model: Sebesky/MiniMax-M3-W4A16-GPTQ
+container: vllm-node-minimax-m3-b12x
+
+build_args:
+  - --vllm-ref
+  - 979b56a66c969ab67655d2155ab4c6c5bed15f65
+  - --apply-vllm-patch
+  - minimax-m3-fused-fp8-kv.patch
+  - --build-rust
+
+cluster_only: true
+mods:
+  # Consolidated full b12x stack plus EAGLE3 draft-model fixes.
+  # run-recipe.py expands the group before invoking launch-cluster.sh.
+  - mods/minimax-m3-gptq-b12x-eagle3
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  draft_tensor_parallel: 2
+  spec_tokens: 3
+  # 0.93 (was 0.9375): the startup free-memory check runs AFTER
+  # APIServer+EngineCore spin up on the head node -- 0.9375 passes or fails
+  # depending on boot-to-boot page-cache state (observed failing at 113.49
+  # free vs 113.78 needed). 0.93 is the stable regime for downstream deploys;
+  # locally you may claw back ~0.6 GiB KV with 0.9375 at the risk of a
+  # startup ValueError (clean failure, safe to retry).
+  gpu_memory_utilization: 0.93
+  max_model_len: 131072
+  max_num_batched_tokens: 1024
+  max_num_seqs: 1
+  block_size: 128
+  # Global fp8 KV. The TARGET sparse/dense layers read+write it natively; the
+  # DRAFT (b12x dense backend, msa_block_sparse=False) inherits this dtype.
+  kv_cache_dtype: fp8_e4m3
+  # EAGLE3 drafter: int4 RTN everywhere incl. embed/lm_head (~1.6 GB).
+  # Place the checkpoint at this path on BOTH nodes (or set to an HF repo id
+  # once published) -- see DEPLOYMENT.md "EAGLE3 drafter".
+  drafter_model: /root/.cache/huggingface/hub/eagle-bf16-rtn-int4
+  attention_backend: b12x
+  load_format: safetensors
+
+# NOTE (2026-07-02): cudagraph_mode was FULL_AND_PIECEWISE, but with mode:0 +
+# VLLM_USE_BREAKABLE_CUDAGRAPH=0 vLLM silently downgrades any piecewise-
+# requiring mode to NONE (vllm/config/vllm.py) -- the whole verify+draft loop
+# ran EAGER, bypassing the b12x decode-graph stack. FULL_DECODE_ONLY (like the
+# non-eagle recipe) survives mode:0 and captures the uniform verify shape
+# (1 + num_speculative_tokens).
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # NOTE: B12X_IDX_SUPERTILE_K=65536 was tried (verify-indexer microbench
+  # 129->120 us/layer @60k, q2k parity PASS) but REJECTED: e2e step time
+  # regressed (~87 -> ~108 ms/step, 34.0 -> 30.5 t/s @60k) despite the
+  # microbench win -- the isolated replica does not capture whatever the
+  # single-chunk gather/score does inside the full verify graph. (Output-text
+  # differences in that run were a chat-template serving config change, not
+  # the kernel.) Keep the default 32768. See runs/eagle3-20260702/REPORT.md.
+  VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+  OMP_NUM_THREADS: "20"
+  MKL_NUM_THREADS: "20"
+  OPENBLAS_NUM_THREADS: "20"
+  NUMEXPR_NUM_THREADS: "20"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  HF_TOKEN: $HF_TOKEN
+  VLLM_M3_FP8_KV_TEST_SCALE: "1.0"
+command: |
+  vllm serve Sebesky/MiniMax-M3-W4A16-GPTQ \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend mp \
+      --block-size {block_size} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --attention-backend {attention_backend} \
+      --attention-config '{{"indexer_kv_dtype": "fp8"}}' \
+      --compilation-config '{{"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_copy_inputs": true}}' \
+      --speculative-config '{{"method":"eagle3","model":"{drafter_model}","draft_tensor_parallel_size":{draft_tensor_parallel},"num_speculative_tokens":{spec_tokens},"attention_backend":"b12x"}}' \
+      --default-chat-template-kwargs '{{"thinking_mode":"enabled"}}' \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --language-model-only \
+      --load-format {load_format} \
+      --reasoning-parser minimax_m3 \
+      --enable-auto-tool-choice \
+      --tool-call-parser minimax_m3

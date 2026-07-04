@@ -1,0 +1,19 @@
+# Recipe-level mod group for the full MiniMax-M3 GPTQ b12x stack.
+#
+# Keep this as orchestration only: the b12x attention kernels/backend live in
+# ../b12x (baked into vllm-node-minimax-m3-b12x). The concrete mods below
+# only patch vLLM compatibility points and install tiny vLLM-local shims to the
+# glue implementation under ../b12x.
+name: minimax-m3-gptq-b12x
+description: >-
+  MiniMax-M3 GPTQ compatibility fixes plus the full b12x vLLM glue stack
+  (b12x indexer, sparse MSA attention, and dense attention backend).
+mods:
+  - mods/fix-prometheus-fastapi-routing
+  - mods/fix-minimax-m3-reasoning-parser-robustness
+  - mods/fix-minimax-m3-compressed-tensors-swiglu-clamp
+  - mods/fix-minimax-m3-indexer-proj-bf16-load
+  - mods/fix-minimax-m3-b12x-indexer
+  - mods/fix-minimax-m3-b12x-msa
+  - mods/fix-minimax-m3-b12x-dense
+  - mods/fix-minimax-m3-b12x-triton-prewarm

@@ -34,6 +34,13 @@ If you want to build the latest from main branch, you can specify `--rebuild-vll
 
 Similarly, `--rebuild-flashinfer`, `--flashinfer-ref`, and `--apply-flashinfer-pr` control the FlashInfer build in the same way.
 
+## MINIMAX-M3 DEPLOYMENT PACKAGE (2xGB10)
+
+To serve `Sebesky/MiniMax-M3-W4A16-GPTQ` across two DGX Sparks with EAGLE3
+speculative decoding and quantized KV (b12x fp8 / b12x nvfp4 / KVarN k4v2),
+see **[DEPLOYMENT.md](DEPLOYMENT.md)** — one-command image build
+(`./build-deploy.sh`) plus three production recipes.
+
 ## QUICK START
 
 ### Build

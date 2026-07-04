@@ -1,0 +1,8 @@
+# Full b12x MiniMax-M3 GPTQ stack plus the EAGLE3 draft-model loader fixes.
+# See ../minimax-m3-gptq-b12x/mod-group.yaml for the backend/glue boundary.
+name: minimax-m3-gptq-b12x-eagle3
+description: >-
+  Full MiniMax-M3 GPTQ b12x stack with EAGLE3 speculative-decoding fixes.
+mods:
+  - mods/minimax-m3-gptq-b12x
+  - mods/fix-eagle3-draft-embed-quant

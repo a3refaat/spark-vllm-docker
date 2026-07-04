@@ -1,0 +1,80 @@
+# syntax=docker/dockerfile:1.6
+#
+# DEPLOYMENT IMAGE: MiniMax-M3-W4A16-GPTQ serving stack for 2xGB10 (DGX Spark)
+# =============================================================================
+# One image serves ALL production recipes; the per-recipe integration mods
+# (b12x routing vs KVarN backport — they patch overlapping vLLM files and are
+# mutually exclusive) are applied into the FRESH container at launch by
+# launch-cluster.sh from this repo's mods/ tree. That launch-time layering is
+# what lets a single image back both stacks:
+#
+#   recipes/minimax-m3-w4a16-gptq-b12x-fp8-eagle3.yaml    fp8 KV,   b12x + EAGLE3
+#   recipes/minimax-m3-w4a16-gptq-b12x-nvfp4-eagle3.yaml  nvfp4 KV, b12x + EAGLE3
+#   recipes/minimax-m3-w4a16-gptq-kvarn-eagle3.yaml       KVarN k4v2, stock Triton + EAGLE3
+#
+# This Dockerfile bakes the parts that are recipe-INDEPENDENT:
+#   * base: vLLM @ g979b56a66 built from source with the minimax-m3-fused-fp8-kv
+#     source patch + Rust tool parser (built by build-and-copy.sh — see
+#     build-deploy.sh for the one-command flow)
+#   * b12x: the SM120/SM121 CuTe-DSL/Triton kernel library, vendored at the
+#     exact tested commit (vendor/b12x/.vendored-from-commit), exposed via a
+#     .pth — pure Python, JIT at runtime, no wheel build, no dependency pins
+#     touched (its torch>=2.12 pin is soft; validated on this image's 2.11)
+#
+# The KVarN backport (vllm-project/vllm PR #46812) and all MiniMax-M3 fix mods
+# ship as diff+script mods in mods/ — self-contained, no network at apply time.
+#
+# Build context = this repo root:
+#   ./build-deploy.sh                 # base + this layer + optional distribution
+# or by hand:
+#   ./build-and-copy.sh --vllm-ref 979b56a66c969ab67655d2155ab4c6c5bed15f65 \
+#       --apply-vllm-patch minimax-m3-fused-fp8-kv.patch --build-rust \
+#       -t vllm-node-minimax-m3
+#   docker build -f Dockerfile.deploy -t vllm-node-minimax-m3-b12x .
+
+ARG BASE_IMAGE=vllm-node-minimax-m3
+FROM ${BASE_IMAGE}
+
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+# vendored b12x (pinned working tree; see vendor/b12x/.vendored-from-commit)
+COPY vendor/b12x /opt/b12x
+
+# Put b12x on sys.path via a .pth (no pip build), then smoke-import the exact
+# integration surface the recipes' mods will use so a broken layer fails the
+# build, not the launch.
+RUN printf '/opt/b12x\n' > /usr/local/lib/python3.12/dist-packages/b12x.pth && \
+    python3 - <<'PY'
+import importlib.util
+import b12x
+from b12x.integration.attention import (
+    B12XPagedAttentionScratchCaps,
+    paged_attention_forward,
+    plan_paged_attention_scratch,
+    clear_attention_caches,
+)
+for _mod in (
+    "b12x.vllm.minimax_m3.backend",
+    "b12x.vllm.minimax_m3.indexer",
+    "b12x.vllm.minimax_m3.msa_attn",
+    "b12x.vllm.minimax_m3.triton_prewarm",
+):
+    assert importlib.util.find_spec(_mod) is not None, f"missing {_mod}"
+print("b12x baked OK:", getattr(b12x, "__version__", "unversioned"))
+PY
+
+# Sanity: the vLLM surfaces the launch-time mods patch must exist in the base.
+# Catches base-image drift (wrong --vllm-ref / missing source patch) at build.
+RUN python3 - <<'PY'
+from pathlib import Path
+pkg = Path("/usr/local/lib/python3.12/dist-packages/vllm")
+for rel in (
+    "models/minimax_m3/common/sparse_attention.py",
+    "models/minimax_m3/common/indexer.py",
+    "v1/attention/backends/fa_utils.py",
+    "v1/spec_decode/llm_base_proposer.py",
+):
+    assert (pkg / rel).exists(), f"base image missing vllm/{rel} — wrong --vllm-ref?"
+import vllm
+print("vLLM base OK:", vllm.__version__)
+PY

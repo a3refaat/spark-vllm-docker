@@ -1,0 +1,4 @@
+date	config	ctx_target	prompt_tokens	completion_tokens	ttft_s	decode_s	decode_tps	overall_tps
+2026-07-03 19:23	kvarn-phase2c	512	563	85	1.213	3.984	21.34	16.36
+2026-07-03 19:23	kvarn-phase2c	16384	16111	87	0.475	3.894	22.34	19.91
+2026-07-03 19:23	kvarn-phase2c	65536	64227	177	0.659	8.247	21.46	19.87

@@ -1,0 +1,17 @@
+component	mode	ctx	mean_us_per_layer	median_us	layers	ms_per_step
+dense-decode-q1	fp8	60000	231.7	227.0	3	0.695
+dense-vfy-multirow	fp8	60000	244.0	223.2	3	0.732
+dense-vfy-native	fp8	60000	243.6	220.6	3	0.731
+msa-decode-q1	fp8	60000	40.3	39.5	57	2.295
+msa-vfy-native	fp8	60000	67.5	67.0	57	3.850
+msa-vfy-multirow	fp8	60000	67.1	66.3	57	3.824
+idx-decode-q1	fp8	60000	88.4	84.9	57	5.037
+idx-vfy-multirow	fp8	60000	166.3	165.9	57	9.481
+dense-decode-q1	nvfp4	60000	202.3	192.6	3	0.607
+dense-vfy-multirow	nvfp4	60000	310.8	309.9	3	0.933
+dense-vfy-native	nvfp4	60000	325.0	320.9	3	0.975
+msa-decode-q1	nvfp4	60000	46.8	44.4	57	2.667
+msa-vfy-native	nvfp4	60000	73.8	73.1	57	4.205
+msa-vfy-multirow	nvfp4	60000	72.8	72.2	57	4.152
+idx-decode-q1	nvfp4	60000	97.8	90.0	57	5.576
+idx-vfy-multirow	nvfp4	60000	268.9	242.8	57	15.325

@@ -1,0 +1,3 @@
+date	config	ctx_target	prompt_tokens	completion_tokens	ttft_s	decode_s	decode_tps	overall_tps
+2026-07-03 20:17	kvarn-final	512	563	85	0.352	3.685	23.07	21.05
+2026-07-03 20:17	kvarn-final	65536	64227	132	0.681	6.181	21.36	19.24

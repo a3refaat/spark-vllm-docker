@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1.6
+#
+# Thin layer: bake b12x — the SM120/SM121 CuTe DSL NVFP4 kernel library — onto
+# the existing MiniMax-M3 vLLM image, for the b12x sparse (MiniMax MSA)
+# attention adoption on the 2xGB10 cluster.
+#
+# SOURCE: the b12x fork working tree at ../b12x (github.com/a3refaat/b12x,
+# branch `minimax-m3` = upstream master + the MiniMax-M3 MSA/nvfp4/indexer
+# work, including the b12x/vllm/minimax_m3 glue). The old spark-vllm-docker
+# vendor/b12x snapshot is retired; develop in the fork.
+#
+# WHY a .pth instead of `pip install`:
+#   * b12x is pure Python (CuTe DSL kernels JIT at runtime via nvidia-cutlass-dsl
+#     4.5.2, already in the base image; the only .cu is the PCIe one-shot
+#     allreduce, which we never use — NCCL handles TP). No C extension to build.
+#   * Its pyproject pins torch>=2.12, but that pin is SOFT: validated that b12x
+#     imports and runs paged MSA decode on GB10 (sm121) under the base image's
+#     torch 2.11. A plain `pip install` would try to satisfy/upgrade torch and
+#     break vLLM; even `--no-deps` keeps build isolation (needs network). A .pth
+#     sidesteps all of that and pins nothing.
+#
+# Build (context = the b12x fork checkout; its .dockerignore drops .git/
+# __pycache__/*.ncu-rep so the context stays ~20MB):
+#   docker build -f Dockerfile.b12x -t vllm-node-minimax-m3-b12x ../b12x
+# Distribute (save|load, no rebuild):
+#   ./build-and-copy.sh --no-build -c <worker> --copy-parallel -t vllm-node-minimax-m3-b12x
+
+ARG BASE_IMAGE=vllm-node-minimax-m3
+FROM ${BASE_IMAGE}
+
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+# fork checkout -> /opt/b12x  (build context IS the b12x repo root)
+COPY . /opt/b12x
+
+# Put b12x on sys.path via a .pth (no pip build), then smoke-import the exact
+# integration surface the MSA mod will use so a broken layer fails the build.
+RUN printf '/opt/b12x\n' > /usr/local/lib/python3.12/dist-packages/b12x.pth && \
+    python3 - <<'PY'
+import importlib.util
+import b12x
+from b12x.integration.attention import (
+    B12XPagedAttentionScratchCaps,
+    paged_attention_forward,
+    plan_paged_attention_scratch,
+    clear_attention_caches,
+)
+for _mod in (
+    "b12x.vllm.minimax_m3.backend",
+    "b12x.vllm.minimax_m3.indexer",
+    "b12x.vllm.minimax_m3.msa_attn",
+    "b12x.vllm.minimax_m3.triton_prewarm",
+):
+    assert importlib.util.find_spec(_mod) is not None, f"missing {_mod}"
+print("b12x baked OK:", getattr(b12x, "__version__", "0.23.0"))
+PY
