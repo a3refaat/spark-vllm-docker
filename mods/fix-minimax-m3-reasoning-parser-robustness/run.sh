@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-# MiniMax-M3 reasoning-parser robustness fix (v2).
+# MiniMax-M3 reasoning-parser robustness fix (v3).
 #
-# Two independent bugs, two fixes:
+# Three independent bugs, three fixes:
 #
 # 1) BACKPORT upstream d8e422ccd "[Bugfix] Parse MiniMax M3 streaming
 #    reasoning by text markers (#45718)" (merged after this image's vLLM).
@@ -34,6 +34,23 @@ set -euo pipefail
 #    content, else returns the text as content. #45718 does not change
 #    extract_reasoning, so the anchors apply cleanly to the backport.
 #
+# 3) FIX is_reasoning_end prompt poisoning (thinking_mode=adaptive leak).
+#    The M3 chat template mentions BOTH markers verbatim in its
+#    <thinking_instructions> system text ("wrap your reasoning in
+#    <mm:think></mm:think> tags..."), and that text tokenizes to the real
+#    single-vocab special ids. is_reasoning_end(prompt_token_ids) -- used to
+#    seed the streaming state (parser/abstract_parser.py parse_delta,
+#    chat_completion/serving.py, structured_output) -- did a whole-prompt
+#    "last marker wins" scan, so every adaptive prompt (no generation
+#    prefill) reports "reasoning already ended": the parser is bypassed and
+#    the model's reasoning plus a literal <mm:think> leak into content.
+#    thinking_mode=enabled only survived by luck (its <mm:think> generation
+#    prefill is the last prompt token, outranking the instruction text).
+#    Fix: only a marker prefilled at the very END of the prompt seeds the
+#    state; ...<mm:think> -> in reasoning, ...</mm:think> (disabled mode
+#    prefill) -> content-only, anything else (adaptive) -> not ended, the
+#    text-marker streaming parser resolves what the model chooses to do.
+#
 # REMOVED from v1: the streaming fence/JSON "answer boundary" heuristic
 # (_stream_answer_boundary). It existed only to mask bug (1) mid-stream and
 # misfired on the first ``` fence or JSON-ish text INSIDE legitimate
@@ -55,8 +72,12 @@ path = Path('/usr/local/lib/python3.12/dist-packages/vllm/reasoning/minimax_m3_r
 backport = Path(os.environ['MOD_DIR']) / 'minimax_m3_reasoning_parser_45718.py'
 
 text = path.read_text()
-if 'def _recover_unclosed_reasoning' in text and '_strip_partial_marker_suffix' in text:
-    print('MiniMax-M3 reasoning-parser robustness fix (v2) already applied:', path)
+if (
+    'def _recover_unclosed_reasoning' in text
+    and '_strip_partial_marker_suffix' in text
+    and 'prefilled at the very END of the prompt' in text
+):
+    print('MiniMax-M3 reasoning-parser robustness fix (v3) already applied:', path)
     raise SystemExit(0)
 
 # ---- 1) wholesale backport of upstream d8e422ccd (#45718) ----
@@ -134,9 +155,44 @@ anchor = '    def is_reasoning_end_streaming(\n'
 assert text.count(anchor) == 1, 'anchor 2c (is_reasoning_end_streaming) not found'
 text = text.replace(anchor, helpers, 1)
 
+# ---- 3) is_reasoning_end: only an end-of-prompt prefill marker counts ----
+old_b3 = (
+    '    def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:\n'
+    '        start_index = self._rfind_token_sequence(input_ids, self._start_token_ids)\n'
+    '        end_index = self._rfind_token_sequence(input_ids, self._end_token_ids)\n'
+    '        if end_index < 0:\n'
+    '            return False\n'
+    '        if start_index < 0:\n'
+    '            return True\n'
+    '        return end_index > start_index\n'
+)
+new_b3 = (
+    '    def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:\n'
+    '        # Called with PROMPT token ids to seed the streaming state. Only a\n'
+    '        # marker prefilled at the very END of the prompt is meaningful: the\n'
+    '        # M3 chat template mentions both markers verbatim in its\n'
+    '        # <thinking_instructions> text (tokenizing to the real special\n'
+    '        # ids), so a whole-prompt scan reports "reasoning ended" for every\n'
+    '        # thinking_mode=adaptive request and the parser is bypassed\n'
+    '        # (reasoning + literal <mm:think> leak into content). Tails:\n'
+    '        #   ...<mm:think>   enabled prefill  -> inside reasoning -> False\n'
+    '        #   ...</mm:think>  disabled prefill -> content only     -> True\n'
+    '        #   anything else   adaptive         -> False; the text-marker\n'
+    '        #                   streaming parser handles whether the model\n'
+    '        #                   opens a block or answers directly.\n'
+    '        end_len = len(self._end_token_ids)\n'
+    '        return bool(\n'
+    '            end_len\n'
+    '            and len(input_ids) >= end_len\n'
+    '            and tuple(input_ids[-end_len:]) == tuple(self._end_token_ids)\n'
+    '        )\n'
+)
+assert text.count(old_b3) == 1, 'anchor 3 (is_reasoning_end) not found'
+text = text.replace(old_b3, new_b3, 1)
+
 path.write_text(text)
 
 import py_compile
 py_compile.compile(str(path), doraise=True)
-print('Applied MiniMax-M3 reasoning parser v2 (#45718 backport + non-streaming recovery):', path)
+print('Applied MiniMax-M3 reasoning parser v3 (#45718 backport + non-streaming recovery + adaptive prompt-poisoning fix):', path)
 PY
