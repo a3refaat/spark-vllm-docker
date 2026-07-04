@@ -17,7 +17,8 @@
 #     source patch + Rust tool parser (built by build-and-copy.sh — see
 #     build-deploy.sh for the one-command flow)
 #   * b12x: the SM120/SM121 CuTe-DSL/Triton kernel library, vendored at the
-#     exact tested commit (vendor/b12x/.vendored-from-commit), exposed via a
+#     exact tested commit (vendor/b12x/.vendored-from-commit; byte-identical
+#     to it minus profiling artifacts: *.ncu-rep, __pycache__), exposed via a
 #     .pth — pure Python, JIT at runtime, no wheel build, no dependency pins
 #     touched (its torch>=2.12 pin is soft; validated on this image's 2.11)
 #
