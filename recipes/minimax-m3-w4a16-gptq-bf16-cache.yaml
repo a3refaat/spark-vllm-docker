@@ -1,0 +1,95 @@
+# Recipe: MiniMax-M3-W4A16 (GPTQ) — BF16 KV cache  [QUALITY-REFERENCE]
+#
+# Serves Sebesky/MiniMax-M3-W4A16-GPTQ with an UNQUANTIZED (bf16) KV cache +
+# bf16 lightning-indexer side cache. This is the clean quality-reference config:
+# no fp8/nvfp4 KV quantization artifacts, so benchmark scores reflect the W4A16
+# *weights* only. Sibling of minimax-m3-w4a16-gptq.yaml (which keeps fp8 KV);
+# the fp8 baseline is intentionally preserved, not overwritten.
+#
+# MEMORY: target weights ~104.5GB/node leave ~8GB/node for KV at 0.93 util. fp8
+# KV gave ~137k-token capacity, so bf16 KV (2x/token) gives ~68k > 65536 -> a
+# 65536 context fits at gpu_memory_utilization 0.93. (If a future change tightens
+# memory, drop max_model_len first.)
+#
+# MODS: only the GPTQ-correctness mods are needed here -
+#   * swiglu-clamp            : CT WNA16 MoE swigluoai clamp (profile_run assert)
+#   * indexer-proj-bf16-load  : REQUIRED. This GPTQ repo keeps index_q/k_proj
+#     UNQUANTIZED (bf16, in the quant `ignore` list); vLLM otherwise folds them
+#     into the quantized fused qkv_proj, the stock loader drops them, and the
+#     indexer scores blocks with garbage -> long-context output degenerates above
+#     ~2048 tokens. Independent of KV dtype, so it is required here too.
+# The fp8-KV / indexer-fp8 / nvfp4 mods are intentionally OMITTED (KV is bf16).
+
+recipe_version: "1"
+name: MiniMax-M3-W4A16-GPTQ-BF16-CACHE
+description: MiniMax-M3 GPTQ W4A16 with bf16 (unquantized) KV+indexer cache on dual Spark/GB10 TP2; clean quality-reference config
+
+model: Sebesky/MiniMax-M3-W4A16-GPTQ
+container: vllm-node-minimax-m3
+
+build_args:
+  - --vllm-ref
+  - 979b56a66c969ab67655d2155ab4c6c5bed15f65
+  - --apply-vllm-patch
+  - minimax-m3-fused-fp8-kv.patch
+  - --build-rust
+
+cluster_only: true
+mods:
+  - mods/fix-prometheus-fastapi-routing
+  - mods/fix-minimax-m3-reasoning-parser-robustness
+  - mods/fix-minimax-m3-compressed-tensors-swiglu-clamp
+  - mods/fix-minimax-m3-indexer-proj-bf16-load
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.93
+  # bf16 KV at 0.93 sized max ctx ~61568 (65536 was ~0.3GB short). 61440=480*128
+  # fits cleanly with margin and is ample for quality benchmarks.
+  max_model_len: 61440
+  max_num_batched_tokens: 2048
+  max_num_seqs: 1
+  block_size: 128
+  # auto -> bf16 (the model dtype). No fp8/nvfp4 KV quantization.
+  kv_cache_dtype: auto
+  attention_backend: TRITON_ATTN
+  load_format: instanttensor
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+  OMP_NUM_THREADS: "20"
+  MKL_NUM_THREADS: "20"
+  OPENBLAS_NUM_THREADS: "20"
+  NUMEXPR_NUM_THREADS: "20"
+  # Keep out of the MiniMax breakable-cudagraph capture wrapper (kept decode CUDA
+  # graphs via FULL_DECODE_ONLY); matches the other GPTQ recipes.
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  # Private HF repo: pass the token through for any hub access.
+  HF_TOKEN: $HF_TOKEN
+
+# bf16 KV + bf16 indexer side-cache: no --attention-config indexer override and no
+# fp8 scale env are needed (the indexer defaults to the model dtype).
+command: |
+  vllm serve Sebesky/MiniMax-M3-W4A16-GPTQ \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend mp \
+      --block-size {block_size} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --attention-backend {attention_backend} \
+      --compilation-config '{{"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_copy_inputs": true}}' \
+      --default-chat-template-kwargs '{{"thinking_mode":"enabled"}}' \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --language-model-only \
+      --load-format {load_format} \
+      --reasoning-parser minimax_m3 \
+      --enable-auto-tool-choice \
+      --tool-call-parser minimax_m3

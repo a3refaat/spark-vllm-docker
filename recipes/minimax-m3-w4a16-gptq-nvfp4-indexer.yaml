@@ -1,0 +1,164 @@
+# Recipe: MiniMax-M3-W4A16 (GPTQ / compressed-tensors)
+#
+# Serves Sebesky/MiniMax-M3-W4A16-GPTQ — a GPTQ (llm-compressor) W4A16 checkpoint
+# exported in the compressed-tensors `pack-quantized` format. This is a sibling
+# of the AutoRound recipe (minimax-m3-w4a16-compressed-tensors.yaml) but differs
+# in ways that matter for serving:
+#
+#   * quant_method = "compressed-tensors"  -> vLLM AUTO-DETECTS from config.json.
+#     Do NOT pass --quantization gptq/auto_gptq/compressed-tensors. The checkpoint
+#     is the source of truth. (Only add --quantization compressed-tensors as a
+#     last-resort if auto-detect ever fails at startup.)
+#
+#   * Linears:    int4, group_size 128, symmetric, actorder = "static" (GPTQ
+#                 activation reordering -> per-Linear g_idx permutation). vLLM's
+#                 compressed-tensors WNA16 Marlin path handles act-order natively;
+#                 if startup ever errors on g_idx / weight_g_idx, that's the first
+#                 suspect for this checkpoint specifically.
+#   * Embeddings: int4, group_size 64, pack-quantized (CompressedTensorsEmbedding
+#                 WNA16Int). Native in the pinned vLLM ref — the old bullerwins
+#                 AutoGPTQ embedding fix mod is NOT needed here.
+#   * lm_head, router gates, lightning-indexer projections, RMSNorms, vision tower
+#                 are all left in bf16 (quantization_config.ignore).
+#
+#   * KV cache:   bf16. The config has kv_cache_scheme = null AND the repo ships
+#                 NO m3_fp8_cache_scales.json sidecar. So the whole fp8-KV stack
+#                 (fp8-kv-scales-read/write, indexer-fp8-read/write, and the
+#                 fp8-cache-scales-load loader) does NOT apply and is intentionally
+#                 omitted below. Default kv_cache_dtype is `auto` (= bf16 here).
+#                 fp8 KV is possible as an experiment, but there are NO calibrated
+#                 scales for this checkpoint, so quality is unvalidated — leave it
+#                 off unless you are explicitly testing the path.
+#
+# MiniMax-M3 specifics that still apply (shared with the rest of the family):
+#   * MSA (sparse attention) requires --block-size 128.
+#   * swigluoai_uninterleave activation needs the CT WNA16 MoE clamp fix mod
+#     (otherwise profile_run asserts: "SWIGLUOAI_UNINTERLEAVE requires clamp_limit").
+#   * Text-only serving: keep --language-model-only (this is a VL checkpoint).
+#   * minimax_m3 reasoning + tool-call parsers (Rust PyO3 ext -> --build-rust).
+#
+# NOTE ON STALE BUILD/MODS (read before --setup):
+#   vLLM + FlashInfer were just rebuilt to the latest nightly, so the container
+#   `vllm-node-minimax-m3` already has a fresh vLLM. The build_args below pin the
+#   OLD known-good ref + fp8-KV source patch only for reproducibility — do NOT run
+#   this recipe with --setup unless you intend to rebuild back to that pinned ref
+#   (it would clobber the nightly). For a normal launch the container is reused and
+#   build_args are inert. The runtime mods patch vLLM source by text anchor, so on
+#   the nightly they may fail with "anchor not found" — expect to reapply/edit them
+#   (stop the cluster with `./launch-cluster.sh stop`, fix the mod, relaunch).
+
+recipe_version: "1"
+name: MiniMax-M3-W4A16-GPTQ-NVFP4-INDEXER
+description: MiniMax-M3 GPTQ W4A16 compressed-tensors (pack-quantized, actorder=static) serving on dual Spark/GB10 TP2; text-only, bf16 KV
+
+model: Sebesky/MiniMax-M3-W4A16-GPTQ
+container: vllm-node-minimax-m3
+
+build_args:
+  # Known-good vLLM commit with MiniMax-M3 support + compressed-tensors packed
+  # WNA16 linear/MoE + packed-embedding support. Pinned for reproducibility only;
+  # see "NOTE ON STALE BUILD/MODS" above before passing --setup on the nightly.
+  - --vllm-ref
+  - 979b56a66c969ab67655d2155ab4c6c5bed15f65
+  - --apply-vllm-patch
+  - minimax-m3-fused-fp8-kv.patch
+  # Build the Rust PyO3 tool-parser extension so --tool-call-parser minimax_m3 works.
+  - --build-rust
+
+cluster_only: true
+# MiniMax-M3 compressed-tensors mod stack for fp8_e4m3 main KV + fp8 indexer.
+# We apply the main KV and indexer fp8 read/write scale patches with neutral scale
+# 1.0, but intentionally do NOT apply fix-minimax-m3-fp8-cache-scales-load because
+# this GPTQ checkpoint has no calibrated m3_fp8_cache_scales.json sidecar.
+mods:
+  - mods/fix-prometheus-fastapi-routing
+  - mods/fix-minimax-m3-reasoning-parser-robustness
+  - mods/fix-minimax-m3-fp8-kv-scales-read
+  - mods/fix-minimax-m3-fp8-kv-scales-write
+  - mods/fix-minimax-m3-indexer-fp8-read
+  - mods/fix-minimax-m3-indexer-fp8-write
+  - mods/fix-minimax-m3-compressed-tensors-swiglu-clamp
+  # REQUIRED for correct long-context output. This GPTQ/compressed-tensors repo
+  # keeps the lightning-indexer projections (index_q_proj/index_k_proj) UNQUANTIZED
+  # (bf16, in the quant `ignore` list), but vLLM folds them into the *quantized*
+  # fused qkv_proj. The stock loader remaps them to `qkv_proj.weight` (which a
+  # quantized module doesn't have) and silently drops them -> the indexer scores
+  # blocks with garbage weights -> top-k selection is wrong -> output degenerates
+  # above sparse_topk_blocks*sparse_block_size (16*128 = 2048) tokens. This mod
+  # loads them into a dedicated bf16 weight and splices them into the fused GEMM.
+  - mods/fix-minimax-m3-indexer-proj-bf16-load
+  - mods/fix-minimax-m3-indexer-nvfp4
+  - mods/debug-minimax-m3-activations
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.93
+  # fp8 KV halves the main KV footprint; keep context conservative for first smoke
+  # test and raise toward the older fp8 recipes once startup/output quality is sane.
+  max_model_len: 65536
+  max_num_batched_tokens: 2048
+  max_num_seqs: 1
+  block_size: 128
+  # Uncalibrated fp8_e4m3 main KV. Scale read/write mods use neutral scale=1.0;
+  # no calibrated sidecar exists for this GPTQ checkpoint.
+  kv_cache_dtype: fp8_e4m3
+  attention_backend: TRITON_ATTN
+  load_format: instanttensor
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+  # Use the GB10/Spark CPU more aggressively. vLLM otherwise reduces Torch CPU
+  # parallelism to 1 thread unless OMP_NUM_THREADS is set externally. In this
+  # TP2/no-ray recipe each node runs one vLLM worker/GPU, so using all 20 CPU
+  # cores per node is appropriate. Reduce these if you later run >1 worker/node.
+  OMP_NUM_THREADS: "20"
+  MKL_NUM_THREADS: "20"
+  OPENBLAS_NUM_THREADS: "20"
+  NUMEXPR_NUM_THREADS: "20"
+  # The fp8 KV/indexer patched path currently crashes TP1 inside vLLM's
+  # MiniMax-specific breakable_cudagraph capture wrapper. Keep decode CUDA graphs
+  # requested in --compilation-config, but opt out of the breakable wrapper and
+  # try the normal FULL_DECODE_ONLY capture path first (not eager).
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  # Private HF repo (Sebesky/MiniMax-M3-W4A16-GPTQ) — the worker fell back to an
+  # online fetch and failed auth ("Invalid username or password"). Pass the token
+  # through so any HF hub access (e.g. image-processor config) authenticates.
+  HF_TOKEN: $HF_TOKEN
+  # Main KV + indexer fp8 scaled read/write mods use this uniform test scale.
+  # Match the validated MiniMax-M3 fp8-KV recipe's non-unit roundtrip check:
+  # write divides by 2, read multiplies by 2. This avoids the bare unscaled e4m3
+  # clamp path (`scale=1.0`) while we do not have calibrated per-layer sidecar
+  # scales for this GPTQ repo.
+  VLLM_M3_FP8_KV_TEST_SCALE: "2.0"
+  # Activation-localization trace (mods/debug-minimax-m3-activations). Logs the
+  # first few small forwards so we can distinguish MoE weight corruption from
+  # KV/cache corruption if output is gibberish.
+  VLLM_M3_DEBUG_ACT: "0"
+
+# Compressed-tensors is selected from the model config; no --quantization flag is
+# needed. Main KV and the lightning-indexer side-cache are both fp8 here.
+command: |
+  vllm serve Sebesky/MiniMax-M3-W4A16-GPTQ \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend mp \
+      --block-size {block_size} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --attention-backend {attention_backend} \
+      --attention-config '{{"indexer_kv_dtype": "nvfp4"}}' \
+      --compilation-config '{{"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_copy_inputs": true}}' \
+      --default-chat-template-kwargs '{{"thinking_mode":"enabled"}}' \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --language-model-only \
+      --load-format {load_format} \
+      --reasoning-parser minimax_m3 \
+      --enable-auto-tool-choice \
+      --tool-call-parser minimax_m3

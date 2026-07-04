@@ -1,0 +1,116 @@
+# Recipe: MiniMax-M3-W4A16-GPTQ + b12x CuTe MSA attention + indexer (SM120/SM121)
+#
+# b12x backends for ALL attention layers (no Triton): sparse layers (3-59) use
+# the b12x MSA main attention (decode = paged MSA, graph-captured; prefill = MSA
+# extend/union-tile) + the lightning indexer (b12x MSA decode/prefill over a
+# packed page-64 fp8 side cache); dense layers (0-2) use the b12x dense paged
+# backend registered as `--attention-backend b12x` (decode paged + prefill
+# extend, msa_block_sparse=False). Main KV is NVFP4 (native 72 B/head packed
+# e2m1 + per-16 e4m3 block scales, read+written natively by the b12x kernels);
+# the indexer side cache stays fp8. Marlin int4 MoE is UNTOUCHED.
+#
+# IMAGE: uses vllm-node-minimax-m3-b12x (built via Dockerfile.b12x: the existing
+# vllm-node-minimax-m3 image + the b12x library on a .pth). Build/distribute with:
+#   ./build-and-copy.sh -t vllm-node-minimax-m3-b12x -f Dockerfile.b12x \
+#       -c <worker> --copy-parallel --no-... (see Dockerfile.b12x header)
+# Do NOT pass --setup (reuse the prebuilt image).
+#
+# Index side cache: SAME indexer KV group, repurposed to b12x's packed page-64
+# uint8 layout (128 fp8 K + 4 fp32 per-token scale = 132 bytes/token); the
+# 64-page table is derived from the 128 block table. b12x main-KV descale =
+# layer._k_scale/_v_scale (= VLLM_M3_FP8_KV_TEST_SCALE).
+
+recipe_version: "1"
+name: MiniMax-M3-W4A16-GPTQ-b12x-nvfp4-idx
+description: MiniMax-M3 GPTQ W4A16 on dual Spark/GB10 TP2; NVFP4 main KV AND NVFP4 indexer KV (per-16 e4m3 block scales, 72 B/tok each), Marlin int4 MoE, b12x CuTe MSA attention (decode+prefill) + b12x MSA indexer (decode+prefill)
+
+model: Sebesky/MiniMax-M3-W4A16-GPTQ
+container: vllm-node-minimax-m3-b12x
+
+build_args:
+  - --vllm-ref
+  - 979b56a66c969ab67655d2155ab4c6c5bed15f65
+  - --apply-vllm-patch
+  - minimax-m3-fused-fp8-kv.patch
+  - --build-rust
+
+cluster_only: true
+# Self-contained b12x integration: the b12x mods own the fp8 KV read/write +
+# scales AND the packed page-64 indexer cache; the legacy fp8-kv-scales-* and
+# indexer-fp8-* mods are intentionally NOT used here.
+mods:
+  # Consolidated recipe-level group. run-recipe.py expands this to the
+  # ordered vLLM compatibility + b12x glue mods; the b12x backend itself
+  # and glue source remain in ../b12x / the b12x image layer.
+  - mods/minimax-m3-gptq-b12x
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  # b12x attention + indexer scratch is now SHARED across all layers (one
+  # caller-owned storage buffer per shape, not one arena per layer), so the
+  # b12x scratch footprint no longer scales with depth. 0.93 matches the Triton
+  # KV budget (previously OOM'd only because of the per-layer scratch blowup).
+  # 0.92 (vs the fp8 recipe's 0.93): a hair of headroom for the safetensors mmap
+  # buff/cache that shrinks reported-free memory at startup. nvfp4's 1.78x KV
+  # capacity vs fp8 makes the ~1.2 GiB difference immaterial.
+  gpu_memory_utilization: 0.90
+  max_model_len: 65536
+  max_num_batched_tokens: 2048
+  max_num_seqs: 1
+  block_size: 128
+  # NVFP4 main K/V: native uint8 packed cache (e2m1 data + per-16 e4m3 block
+  # scales = head/2 + head/16 = 72 B/head). b12x reads the block scales from the
+  # cache directly (no per-tensor descale); writes via the capture-safe
+  # threshold-sum block-quant (b12x_backend.nvfp4_block_quant_write). The indexer
+  # side cache stays fp8 (indexer_kv_dtype below). Validated bit-exact in the
+  # parity harness (decode/extend/MSA + serving-write round trip).
+  kv_cache_dtype: nvfp4
+  # Dense layers (0-2) -> b12x dense paged backend (registry enum B12X). Sparse
+  # layers override this with their own MiniMaxM3SparseBackend (b12x MSA impl).
+  attention_backend: b12x
+  load_format: instanttensor
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+  OMP_NUM_THREADS: "20"
+  MKL_NUM_THREADS: "20"
+  OPENBLAS_NUM_THREADS: "20"
+  NUMEXPR_NUM_THREADS: "20"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  # FULL_DECODE_ONLY capture sizes are tiny ([1,2]); actual graph pool memory is
+  # ~0.05 GiB but the profiler reserves ~0.66 GiB. Reclaim it for the KV cache
+  # (the b12x scratch is already accounted for by the shared-storage buffers).
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  HF_TOKEN: $HF_TOKEN
+  # b12x main-KV fp8 round-trip scale (write divides, b12x read descales).
+  VLLM_M3_FP8_KV_TEST_SCALE: "1.0"
+  # NOTE: B12X_IDX_SUPERTILE_K knob exists (indexer prefill supertile width,
+  # default 32768). MEASURED: lowering it shrinks the eager logits buffer but
+  # GROWS the cross-supertile merge workspace MORE -> net LESS KV cache. Leave
+  # at the b12x default (best KV); it is prefill-only and does not affect decode.
+
+command: |
+  vllm serve Sebesky/MiniMax-M3-W4A16-GPTQ \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend mp \
+      --block-size {block_size} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --attention-backend {attention_backend} \
+      --attention-config '{{"indexer_kv_dtype": "nvfp4"}}' \
+      --compilation-config '{{"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_copy_inputs": true}}' \
+      --default-chat-template-kwargs '{{"thinking_mode":"enabled"}}' \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --language-model-only \
+      --load-format {load_format} \
+      --reasoning-parser minimax_m3 \
+      --enable-auto-tool-choice \
+      --tool-call-parser minimax_m3

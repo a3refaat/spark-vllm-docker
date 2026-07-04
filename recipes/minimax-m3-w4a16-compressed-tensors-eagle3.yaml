@@ -1,0 +1,76 @@
+# Recipe: MiniMax-M3-W4A16 compressed-tensors + EAGLE3 drafter
+#
+# Same target as minimax-m3-w4a16-compressed-tensors.yaml, plus the quantized
+# EAGLE3 drafter repo Sebesky/MiniMax-M3-EAGLE-W4A16. vLLM EAGLE3 requires the
+# speculative_config method key to be "eagle3" and uses
+# draft_tensor_parallel_size, not tensor_parallel_size, inside that JSON.
+
+recipe_version: "1"
+name: MiniMax-M3-W4A16-compressed-tensors-eagle3
+description: MiniMax-M3 AutoRound W4A16 compressed-tensors with quantized EAGLE3 speculative decoding
+
+model: Sebesky/MiniMax-M3-W4A16
+container: vllm-node-minimax-m3
+
+build_args:
+  - --vllm-ref
+  - 979b56a66c969ab67655d2155ab4c6c5bed15f65
+  - --apply-vllm-patch
+  - minimax-m3-fused-fp8-kv.patch
+  - --build-rust
+
+cluster_only: true
+mods:
+  - mods/fix-prometheus-fastapi-routing
+  - mods/fix-minimax-m3-reasoning-parser-robustness
+  - mods/fix-minimax-m3-fp8-kv-scales-read
+  - mods/fix-minimax-m3-fp8-kv-scales-write
+  - mods/fix-minimax-m3-indexer-fp8-read
+  - mods/fix-minimax-m3-indexer-fp8-write
+  - mods/fix-minimax-m3-compressed-tensors-swiglu-clamp
+  - mods/fix-minimax-m3-fp8-cache-scales-load
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  draft_tensor_parallel: 2
+  spec_tokens: 2
+  gpu_memory_utilization: 0.93
+  max_model_len: 114688
+  max_num_batched_tokens: 2048
+  max_num_seqs: 1
+  block_size: 128
+  kv_cache_dtype: fp8_e4m3
+  attention_backend: TRITON_ATTN
+  load_format: instanttensor
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+  VLLM_M3_FP8_CACHE_SCALES_REPO: "Sebesky/MiniMax-M3-W4A16"
+  VLLM_M3_FP8_KV_TEST_SCALE: "1.0"
+
+command: |
+  vllm serve Sebesky/MiniMax-M3-W4A16 \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend mp \
+      --block-size {block_size} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --attention-backend {attention_backend} \
+      --attention-config '{{"indexer_kv_dtype": "fp8"}}' \
+      --compilation-config '{{"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}}' \
+      --default-chat-template-kwargs '{{"thinking_mode":"enabled"}}' \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --language-model-only \
+      --load-format {load_format} \
+      --speculative-config '{{"method":"eagle3","model":"Sebesky/MiniMax-M3-EAGLE-W4A16","draft_tensor_parallel_size":{draft_tensor_parallel},"num_speculative_tokens":{spec_tokens}}}' \
+      --reasoning-parser minimax_m3 \
+      --enable-auto-tool-choice \
+      --tool-call-parser minimax_m3
