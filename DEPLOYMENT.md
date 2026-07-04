@@ -57,19 +57,20 @@ it is pure Python/JIT — no wheel builds, no dependency changes.
 
 ### EAGLE3 drafter
 
-The recipes expect the int4-RTN EAGLE3 drafter checkpoint (single Llama-style
-decoder block, ~1.6 GB, embed_tokens/lm_head quantized too) at
+The recipes pull the int4-RTN EAGLE3 drafter (single Llama-style decoder
+block, ~1.6 GB, embed_tokens/lm_head quantized too) from
+[`Sebesky/MiniMax-M3-EAGLE3-RTN-INT4`](https://huggingface.co/Sebesky/MiniMax-M3-EAGLE3-RTN-INT4)
+via the recipes' `drafter_model:` default. Prefetch it to both nodes to
+avoid a first-launch download inside the serving containers:
 
-```
-~/.cache/huggingface/hub/eagle-bf16-rtn-int4/   # config.json + model.safetensors
+```bash
+./hf-download.sh Sebesky/MiniMax-M3-EAGLE3-RTN-INT4 -c <worker-ip>
 ```
 
-on **both** nodes. If you obtained it as an HF repo instead, edit the
-`drafter_model:` default in the recipe (an HF repo id works there — vLLM
-resolves it directly). Do not substitute a bf16 or "slim" (shared
-embed/lm_head) drafter — the int4-everything variant with its own
-embed/lm_head is the validated one; the loader mod
-(`fix-eagle3-draft-embed-quant`) depends on the draft quant config.
+Do not substitute a bf16 or "slim" (shared embed/lm_head) drafter — the
+int4-everything variant with its own embed/lm_head is the validated one;
+the loader mod (`fix-eagle3-draft-embed-quant`) depends on the draft quant
+config.
 
 ## 3. Serve
 

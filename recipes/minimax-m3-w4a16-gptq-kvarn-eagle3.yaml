@@ -74,9 +74,9 @@ defaults:
   kv_cache_dtype: kvarn_k4v2_g128
   load_format: instanttensor
   # EAGLE3 drafter: int4 RTN everywhere incl. embed/lm_head (~1.6 GB).
-  # Place the checkpoint at this path on BOTH nodes (or set to an HF repo id
-  # once published) -- see DEPLOYMENT.md "EAGLE3 drafter".
-  drafter_model: /root/.cache/huggingface/hub/eagle-bf16-rtn-int4
+  # HF repo id resolves on both nodes at load (prefetch with hf-download.sh
+  # to avoid first-launch download) -- see DEPLOYMENT.md "EAGLE3 drafter".
+  drafter_model: Sebesky/MiniMax-M3-EAGLE3-RTN-INT4
   draft_tensor_parallel: 2
   spec_tokens: 3
 
