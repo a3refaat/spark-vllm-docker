@@ -339,6 +339,16 @@ if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
     # Triton Cache
     DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.triton:/root/.triton"
     CACHE_DIRS_TO_CREATE+=("$HOME/.triton")
+
+    # b12x CuTe DSL object cache (default ~/.cache/b12x/cute_compile) AND the
+    # NVRTC/driver JIT cache (~/.nv, where DG_JIT_USE_NVRTC=1 lands the compiled
+    # cubins). Persisting BOTH to the host keeps the one-time MSA/indexer JIT
+    # compiles warm across container restarts -- created on every node so each
+    # warms its own copy.
+    DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.cache/b12x:/root/.cache/b12x"
+    CACHE_DIRS_TO_CREATE+=("$HOME/.cache/b12x")
+    DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.cache/container-nv:/root/.nv"
+    CACHE_DIRS_TO_CREATE+=("$HOME/.cache/container-nv")
 fi
 
 # Resolve launch script path if specified
@@ -801,6 +811,10 @@ copy_script_to_worker() {
 get_env_flags() {
     local node_ip="$1"
     printf -- '-e %s ' \
+        "HF_TOKEN=$HF_TOKEN" \
+        "HUGGING_FACE_HUB_TOKEN=$HF_TOKEN" \
+        "HF_HUB_OFFLINE=1" \
+        "TRANSFORMERS_OFFLINE=1" \
         "VLLM_HOST_IP=$node_ip" \
         "RAY_NODE_IP_ADDRESS=$node_ip" \
         "RAY_OVERRIDE_NODE_IP_ADDRESS=$node_ip" \

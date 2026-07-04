@@ -60,8 +60,9 @@ it is pure Python/JIT — no wheel builds, no dependency changes.
 The recipes pull the int4-RTN EAGLE3 drafter (single Llama-style decoder
 block, ~1.6 GB, embed_tokens/lm_head quantized too) from
 [`Sebesky/MiniMax-M3-EAGLE3-RTN-INT4`](https://huggingface.co/Sebesky/MiniMax-M3-EAGLE3-RTN-INT4)
-via the recipes' `drafter_model:` default. Prefetch it to both nodes to
-avoid a first-launch download inside the serving containers:
+via the recipes' `drafter_model:` default. Prefetching to both nodes is
+**required** — the serving containers run with `HF_HUB_OFFLINE=1` (weights
+must come from the mounted host cache; no downloads at load time):
 
 ```bash
 ./hf-download.sh Sebesky/MiniMax-M3-EAGLE3-RTN-INT4 -c <worker-ip>

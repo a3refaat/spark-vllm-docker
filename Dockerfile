@@ -221,13 +221,31 @@ RUN if [ -n "$VLLM_PRS" ]; then \
         done; \
     fi
 
+# Apply local vLLM source patches (space-separated filenames found under
+# patches/vllm/ in the build context), e.g. the MiniMax-M3 fused FP8-KV kernel
+# patch. Applied AFTER PR merges so they stack on top of --apply-vllm-pr changes.
+# The whole patches/ tree is copied (unconditionally) so helper scripts used by
+# later build stages (e.g. strip-vllm-rs-binary.py) are always available.
+ARG VLLM_PATCHES=""
+COPY patches/ /workspace/local-patches/
+RUN if [ -n "$VLLM_PATCHES" ]; then \
+        set -eux; \
+        for p in $VLLM_PATCHES; do \
+            echo "Applying local vLLM patch: $p"; \
+            git apply -v --whitespace=nowarn "/workspace/local-patches/vllm/$p"; \
+        done; \
+    else \
+        echo "No local vLLM patches requested (VLLM_PATCHES empty)."; \
+    fi
+
 # TEMPORARY PATCH for broken FP8 kernels - https://github.com/vllm-project/vllm/pull/35568
 RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/35568.diff -o pr35568.diff \
     && if git apply --reverse --check pr35568.diff 2>/dev/null; then \
          echo "PR 35568 already applied, skipping."; \
        else \
          echo "Applying PR 35568..."; \
-         git apply -v --exclude="tests/*" pr35568.diff; \
+         git apply -v --exclude="tests/*" pr35568.diff \
+           || echo "WARNING: PR 35568 does not apply at this vLLM ref (e.g. a pinned older commit where the targeted files differ); skipping."; \
        fi \
     && rm pr35568.diff
 
@@ -241,12 +259,9 @@ RUN set -eux; \
         echo "PR #41524 regression found; reverting ${patch_commit}"; \
         if ! git revert --no-commit "$patch_commit"; then \
             git revert --abort 2>/dev/null || true; \
-            echo "ERROR: PR #41524 appears present but could not be reverted"; \
-            exit 1; \
-        fi; \
-        if grep -q "$marker" "$target"; then \
-            echo "ERROR: revert completed but PR #41524 marker is still present"; \
-            exit 1; \
+            echo "WARNING: PR #41524 marker present but commit ${patch_commit} could not be reverted at this vLLM ref; continuing without the revert."; \
+        elif grep -q "$marker" "$target"; then \
+            echo "WARNING: revert completed but PR #41524 marker is still present; continuing."; \
         fi; \
     else \
         echo "PR #41524 regression marker not present; skipping revert"; \
@@ -272,9 +287,43 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 # RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/34758.diff | patch -p1 -R || echo "Cannot revert PR #34758, skipping"
 # RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/34302.diff | patch -p1 -R || echo "Cannot revert PR #34302, skipping"
 
+# Optionally build the Rust PyO3 tool-parser extension (vllm._rust_tool_parser),
+# which powers --tool-call-parser minimax_m3 (and the other Rust tool parsers).
+# Without a Rust toolchain, setuptools-rust silently skips the (optional) Rust
+# extensions, so the wheel ships without vllm._rust_tool_parser. When
+# VLLM_BUILD_RUST=1 we install the pinned toolchain, strip the heavy vllm-rs
+# server binary (so only the lightweight pure-Rust cdylib compiles), and make the
+# frontend REQUIRED at build time so a missing parser fails the build loudly.
+ARG VLLM_BUILD_RUST=0
+ENV VLLM_BUILD_RUST=${VLLM_BUILD_RUST}
+# Install into a FRESH prefix to avoid the CUDA base image's pre-seeded
+# /usr/local/rustup (whose settings.toml makes rustup-init "skip toolchain
+# installation" and leaves no usable default toolchain).
+ENV CARGO_HOME=/opt/rust/cargo
+ENV RUSTUP_HOME=/opt/rust/rustup
+ENV PATH=/opt/rust/cargo/bin:$PATH
+RUN if [ "$VLLM_BUILD_RUST" = "1" ]; then \
+        set -eux; \
+        # Honor rust/rust-toolchain.toml if present (newer vLLM pins e.g. 1.95);
+        # older refs (e.g. the M3 release merge) have no pin -> use stable, which
+        # satisfies the workspace's edition = "2024" (needs Rust >= 1.85).
+        RUST_CHANNEL=stable; \
+        if [ -f rust/rust-toolchain.toml ]; then \
+            RUST_CHANNEL="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust/rust-toolchain.toml)"; \
+            : "${RUST_CHANNEL:=stable}"; \
+        fi; \
+        echo "Rust channel: ${RUST_CHANNEL}"; \
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh; \
+        sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal --default-toolchain "${RUST_CHANNEL}"; \
+        rm -f /tmp/rustup-init.sh; \
+        rustc --version; cargo --version; \
+        python3 /workspace/local-patches/strip-vllm-rs-binary.py .; \
+    fi
+
 # Final Compilation
 RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    if [ "$VLLM_BUILD_RUST" = "1" ]; then export VLLM_REQUIRE_RUST_FRONTEND=1; fi && \
     uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
     # dump git ref in the wheels dir
     git rev-parse HEAD > /workspace/wheels/.vllm-commit

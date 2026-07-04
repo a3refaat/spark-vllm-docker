@@ -21,6 +21,11 @@ TMP_IMAGE=""
 PARALLEL_COPY=false
 EXP_MXFP4=false
 VLLM_PRS=""
+# Space-separated list of local patch filenames (under patches/vllm/) to apply to
+# the vLLM source before building, e.g. minimax-m3-fused-fp8-kv.patch.
+VLLM_PATCHES=""
+# When true, build the Rust PyO3 tool-parser extension (vllm._rust_tool_parser).
+BUILD_RUST=false
 FLASHINFER_PRS=""
 PRE_TRANSFORMERS=false
 FULL_LOG=false
@@ -283,6 +288,8 @@ usage() {
     echo "  --tf5                         : Install transformers>=5 (aliases: --pre-tf, --pre-transformers)"
     echo "  --exp-mxfp4, --experimental-mxfp4 : Build with experimental native MXFP4 support"
     echo "  --apply-vllm-pr <pr-num>      : Apply a specific PR patch to vLLM source. Can be specified multiple times."
+    echo "  --apply-vllm-patch <file>     : Apply a local patch (under patches/vllm/) to vLLM source. Repeatable. Forces a vLLM rebuild."
+    echo "  --build-rust                  : Build the Rust tool-parser extension (vllm._rust_tool_parser). Forces a vLLM rebuild."
     echo "  --apply-flashinfer-pr <pr-num>: Apply a specific PR patch to FlashInfer source. Can be specified multiple times."
     echo "  --full-log                    : Enable full build logging (--progress=plain)"
     echo "  --no-build                    : Skip building, only copy image (requires --copy-to)"
@@ -331,6 +338,20 @@ while [[ "$#" -gt 0 ]]; do
                exit 1
             fi
             ;;
+        --apply-vllm-patch)
+            if [ -n "$2" ] && [[ "$2" != -* ]]; then
+               if [ -n "$VLLM_PATCHES" ]; then
+                   VLLM_PATCHES="$VLLM_PATCHES $2"
+               else
+                   VLLM_PATCHES="$2"
+               fi
+               shift
+            else
+               echo "Error: --apply-vllm-patch requires a patch filename (under patches/vllm/)."
+               exit 1
+            fi
+            ;;
+        --build-rust) BUILD_RUST=true ;;
         --apply-flashinfer-pr)
             if [ -n "$2" ] && [[ "$2" != -* ]]; then
                if [ -n "$FLASHINFER_PRS" ]; then
@@ -569,7 +590,7 @@ if [ "$NO_BUILD" = false ]; then
         # ----------------------------------------------------------
         # Phase 2: vLLM wheels
         # ----------------------------------------------------------
-        if [ "$VLLM_REF_SET" = true ] || [ -n "$VLLM_PRS" ]; then
+        if [ "$VLLM_REF_SET" = true ] || [ -n "$VLLM_PRS" ] || [ -n "$VLLM_PATCHES" ] || [ "$BUILD_RUST" = true ]; then
             REBUILD_VLLM=true
         fi
 
@@ -615,6 +636,16 @@ if [ "$NO_BUILD" = false ]; then
             if [ -n "$VLLM_PRS" ]; then
                 echo "Applying vLLM PRs: $VLLM_PRS"
                 VLLM_CMD+=("--build-arg" "VLLM_PRS=$VLLM_PRS")
+            fi
+
+            if [ -n "$VLLM_PATCHES" ]; then
+                echo "Applying local vLLM patches: $VLLM_PATCHES"
+                VLLM_CMD+=("--build-arg" "VLLM_PATCHES=$VLLM_PATCHES")
+            fi
+
+            if [ "$BUILD_RUST" = true ]; then
+                echo "Building Rust tool-parser extension (vllm._rust_tool_parser)"
+                VLLM_CMD+=("--build-arg" "VLLM_BUILD_RUST=1")
             fi
 
             VLLM_CMD+=(".")

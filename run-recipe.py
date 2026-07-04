@@ -63,7 +63,7 @@ RECIPE YAML SCHEMA:
     command: str           # Required: vLLM serve command with {placeholders}
     description: str       # Optional: Brief description
     model: str             # Optional: HuggingFace model ID for --setup
-    mods: list[str]        # Optional: Mod directories to apply
+    mods: list[str]        # Optional: Mod dirs or mod-group dirs to apply
     defaults: dict         # Optional: Default values for command placeholders
     env: dict              # Optional: Environment variables
     build_args: list[str]  # Optional: Args for build-and-copy.sh
@@ -129,7 +129,8 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
         command (str, required): vLLM serve command template with {placeholders}
         description (str, optional): Brief description shown in --list
         model (str, optional): HuggingFace model ID for --setup downloads
-        mods (list[str], optional): List of mod directories to apply (e.g., 'mods/fix-glm')
+        mods (list[str], optional): List of mod directories to apply (e.g., 'mods/fix-glm'),
+            or mod-group directories/files that expand to ordered mod directories.
         defaults (dict, optional): Default values for command placeholders
         env (dict, optional): Environment variables to export before running
         build_args (list[str], optional): Extra args for build-and-copy.sh (e.g., ['-f', 'Dockerfile.mxfp4'])
@@ -198,6 +199,57 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
     return recipe
 
 
+def _resolve_repo_path(path: str | os.PathLike[str]) -> Path:
+    """Resolve a recipe/mod path relative to the repository root."""
+    p = Path(os.path.expanduser(str(path)))
+    if not p.is_absolute():
+        p = SCRIPT_DIR / p
+    return p
+
+
+def _mod_group_file(mod: str) -> Path | None:
+    """Return the manifest for a mod group, if *mod* names one.
+
+    A mod group is a directory containing ``mod-group.yaml`` (preferred for
+    recipe readability) or a YAML file with a top-level ``mods`` list. Groups are
+    expanded by run-recipe.py before calling launch-cluster.sh, so the low-level
+    launcher still receives ordinary mod directories with run.sh files.
+    """
+    p = _resolve_repo_path(mod)
+    if p.is_dir():
+        candidate = p / "mod-group.yaml"
+        return candidate if candidate.exists() else None
+    if p.is_file() and p.suffix in {".yaml", ".yml"}:
+        return p
+    return None
+
+
+def expand_mod_groups(mods: list[str], _seen: set[Path] | None = None) -> list[str]:
+    """Expand recipe-level mod groups into the concrete ordered mod list."""
+    expanded: list[str] = []
+    seen = _seen if _seen is not None else set()
+    for mod in mods:
+        group_file = _mod_group_file(mod)
+        if group_file is None:
+            expanded.append(mod)
+            continue
+        group_file = group_file.resolve()
+        if group_file in seen:
+            cycle = " -> ".join(str(p) for p in [*seen, group_file])
+            print(f"Error: cyclic mod-group include: {cycle}")
+            sys.exit(1)
+        with open(group_file) as f:
+            group = yaml.safe_load(f) or {}
+        child_mods = group.get("mods")
+        if not isinstance(child_mods, list):
+            print(f"Error: mod group {group_file} must contain a top-level 'mods' list")
+            sys.exit(1)
+        seen.add(group_file)
+        expanded.extend(expand_mod_groups([str(m) for m in child_mods], seen))
+        seen.remove(group_file)
+    return expanded
+
+
 def list_recipes() -> None:
     """
     List all available recipes with their metadata.
@@ -247,7 +299,12 @@ def list_recipes() -> None:
             if build_args:
                 print(f"    Build args: {' '.join(build_args)}")
             if mods:
-                print(f"    Mods: {', '.join(mods)}")
+                expanded_mods = expand_mod_groups(mods)
+                if expanded_mods != mods:
+                    print(f"    Mod group(s): {', '.join(mods)}")
+                    print(f"    Expands to: {', '.join(expanded_mods)}")
+                else:
+                    print(f"    Mods: {', '.join(mods)}")
             print()
         except Exception as e:
             print(f"  {recipe_path.name} (error loading: {e})")
@@ -465,7 +522,19 @@ def generate_launch_script(
     if env_vars:
         lines.append("# Environment variables")
         for key, value in env_vars.items():
-            lines.append(f'export {key}="{value}"')
+            # Expand $VAR / ${VAR} against the HOST environment at generation
+            # time. The launch script is later copied into the container (and
+            # scp'd to workers) and executed there, where host-side values like
+            # HF_TOKEN do not exist -- so a literal "$HF_TOKEN" would expand to
+            # empty in-container. Resolving here lets recipes reference host
+            # secrets/config, e.g.  HF_TOKEN: $HF_TOKEN
+            expanded = os.path.expandvars(str(value))
+            if "$" in expanded:
+                print(
+                    f"Warning: recipe env '{key}' has an unresolved variable after "
+                    f"host expansion: {expanded!r} -- is it exported in your shell?"
+                )
+            lines.append(f'export {key}="{expanded}"')
         lines.append("")
 
     # Format the command with parameters
@@ -1183,6 +1252,9 @@ Examples:
                         f"         vLLM uses last value; extra args appear after template substitution"
                     )
 
+    # Expand recipe-level mod groups once so dry-run and launch agree exactly.
+    expanded_mods = expand_mod_groups(recipe.get("mods", []))
+
     # Generate launch script
     script_content = generate_launch_script(
         recipe,
@@ -1201,7 +1273,7 @@ Examples:
         print()
         print("2. launch-cluster.sh is called with:")
         cmd_parts = ["   ./launch-cluster.sh", "-t", container]
-        for mod in recipe.get("mods", []):
+        for mod in expanded_mods:
             cmd_parts.extend(["--apply-mod", mod])
         if args.solo:
             cmd_parts.append("--solo")
@@ -1259,8 +1331,8 @@ Examples:
         cmd = [str(LAUNCH_SCRIPT), "-t", container]
 
         # Add mods
-        for mod in recipe.get("mods", []):
-            mod_path = SCRIPT_DIR / mod
+        for mod in expanded_mods:
+            mod_path = _resolve_repo_path(mod)
             if not mod_path.exists():
                 print(f"Warning: Mod path not found: {mod_path}")
             cmd.extend(["--apply-mod", str(mod_path)])
@@ -1319,8 +1391,12 @@ Examples:
 
         print(f"=== Launching ===")
         print(f"Container: {container}")
-        if recipe.get("mods"):
-            print(f"Mods: {', '.join(recipe['mods'])}")
+        if expanded_mods:
+            if expanded_mods != recipe.get("mods", []):
+                print(f"Mod group(s): {', '.join(recipe.get('mods', []))}")
+                print(f"Expanded mods: {', '.join(expanded_mods)}")
+            else:
+                print(f"Mods: {', '.join(expanded_mods)}")
         if is_cluster:
             print(f"Cluster: {len(nodes)} nodes")
         else:
