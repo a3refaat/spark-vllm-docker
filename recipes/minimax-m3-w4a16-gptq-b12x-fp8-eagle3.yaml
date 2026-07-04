@@ -39,12 +39,11 @@ defaults:
   tensor_parallel: 2
   draft_tensor_parallel: 2
   spec_tokens: 3
-  # 0.93 (was 0.9375): the startup free-memory check runs AFTER
-  # APIServer+EngineCore spin up on the head node -- 0.9375 passes or fails
-  # depending on boot-to-boot page-cache state (observed failing at 113.49
-  # free vs 113.78 needed). 0.93 is the stable regime for downstream deploys;
-  # locally you may claw back ~0.6 GiB KV with 0.9375 at the risk of a
-  # startup ValueError (clean failure, safe to retry).
+  # 0.9375 claws back ~0.6 GiB KV over 0.93, but is knife-edge: the startup
+  # free-memory check runs AFTER APIServer+EngineCore spin up on the head
+  # node, and 0.9375 passes or fails with boot-to-boot page-cache state
+  # (observed failing at 113.49 free vs 113.78 needed). Failures are clean
+  # ValueErrors -- retry, or drop to 0.93 for guaranteed starts.
   gpu_memory_utilization: 0.9375
   max_model_len: 131072
   max_num_batched_tokens: 1024
