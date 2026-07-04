@@ -109,7 +109,7 @@ command: |
       --kv-cache-dtype {kv_cache_dtype} \
       --attention-config '{{"indexer_kv_dtype": "kvarn"}}' \
       --compilation-config '{{"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_copy_inputs": true}}' \
-      --default-chat-template-kwargs '{{"thinking_mode":"enabled"}}' \
+      --default-chat-template-kwargs '{{"thinking_mode":"adaptive"}}' \
       --max-model-len {max_model_len} \
       --max-num-batched-tokens {max_num_batched_tokens} \
       --max-num-seqs {max_num_seqs} \

@@ -45,7 +45,7 @@ defaults:
   # free vs 113.78 needed). 0.93 is the stable regime for downstream deploys;
   # locally you may claw back ~0.6 GiB KV with 0.9375 at the risk of a
   # startup ValueError (clean failure, safe to retry).
-  gpu_memory_utilization: 0.93
+  gpu_memory_utilization: 0.9375
   max_model_len: 131072
   max_num_batched_tokens: 1024
   max_num_seqs: 1
@@ -98,7 +98,7 @@ command: |
       --attention-config '{{"indexer_kv_dtype": "fp8"}}' \
       --compilation-config '{{"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_copy_inputs": true}}' \
       --speculative-config '{{"method":"eagle3","model":"{drafter_model}","draft_tensor_parallel_size":{draft_tensor_parallel},"num_speculative_tokens":{spec_tokens},"attention_backend":"b12x"}}' \
-      --default-chat-template-kwargs '{{"thinking_mode":"enabled"}}' \
+      --default-chat-template-kwargs '{{"thinking_mode":"adaptive"}}' \
       --max-model-len {max_model_len} \
       --max-num-batched-tokens {max_num_batched_tokens} \
       --max-num-seqs {max_num_seqs} \
