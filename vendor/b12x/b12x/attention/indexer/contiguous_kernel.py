@@ -2106,27 +2106,53 @@ class SparseNSAContiguousLogitsPrefillKernel:
             # Overlap: issue weight loads before TMA sync (no K dependency)
             w_linear = tx * Int32(4)
             while w_linear < Int32(_PREFILL_BLOCK_Q * _MAX_Q_HEADS):
-                w_q_local = w_linear // num_heads
-                w_head = w_linear % num_heads
-                w_q_row = q_tile_base + w_q_local
+                # Per-slot (q_row, head) mapping. The smem layout is
+                # w[q_local * num_heads + head], so the 4 slots of one
+                # st_shared_v4_f32 span MULTIPLE q rows whenever
+                # num_heads % 4 != 0 (M3 under TP2: num_heads == 2). The old
+                # code derived a single (w_q_local, w_head) for all 4 slots and
+                # bounds-guarded heads 2/3 to 0.0 -- zeroing every ODD q row's
+                # staged weights, which multiplied that row's block scores to
+                # exact zeros and degenerated its top-k selection to
+                # [0..topk-2]+forced-local. Fix: index each slot independently.
+                w_q0 = (w_linear + Int32(0)) // num_heads
+                w_h0 = (w_linear + Int32(0)) % num_heads
+                w_q1 = (w_linear + Int32(1)) // num_heads
+                w_h1 = (w_linear + Int32(1)) % num_heads
+                w_q2 = (w_linear + Int32(2)) // num_heads
+                w_h2 = (w_linear + Int32(2)) % num_heads
+                w_q3 = (w_linear + Int32(3)) // num_heads
+                w_h3 = (w_linear + Int32(3)) % num_heads
                 w0 = (
-                    Float32(weights[w_q_row, w_head])
-                    if (w_q_row < valid_q_rows and w_head < num_heads)
+                    Float32(weights[q_tile_base + w_q0, w_h0])
+                    if (
+                        q_tile_base + w_q0 < valid_q_rows
+                        and w_q0 < Int32(_PREFILL_BLOCK_Q)
+                    )
                     else Float32(0.0)
                 )
                 w1 = (
-                    Float32(weights[w_q_row, w_head + Int32(1)])
-                    if (w_q_row < valid_q_rows and w_head + Int32(1) < num_heads)
+                    Float32(weights[q_tile_base + w_q1, w_h1])
+                    if (
+                        q_tile_base + w_q1 < valid_q_rows
+                        and w_q1 < Int32(_PREFILL_BLOCK_Q)
+                    )
                     else Float32(0.0)
                 )
                 w2 = (
-                    Float32(weights[w_q_row, w_head + Int32(2)])
-                    if (w_q_row < valid_q_rows and w_head + Int32(2) < num_heads)
+                    Float32(weights[q_tile_base + w_q2, w_h2])
+                    if (
+                        q_tile_base + w_q2 < valid_q_rows
+                        and w_q2 < Int32(_PREFILL_BLOCK_Q)
+                    )
                     else Float32(0.0)
                 )
                 w3 = (
-                    Float32(weights[w_q_row, w_head + Int32(3)])
-                    if (w_q_row < valid_q_rows and w_head + Int32(3) < num_heads)
+                    Float32(weights[q_tile_base + w_q3, w_h3])
+                    if (
+                        q_tile_base + w_q3 < valid_q_rows
+                        and w_q3 < Int32(_PREFILL_BLOCK_Q)
+                    )
                     else Float32(0.0)
                 )
                 st_shared_v4_f32(
